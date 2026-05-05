@@ -6,6 +6,132 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-05
+
+### Added
+
+- **Full TUI main menu panels** in `openvtc` — 8 panels: Inbox, Relationships, Credentials, Settings, VTA Service, Logs, Help/Status, Quit
+- **Inbox panel** with real-time task processing: auto-handles trust-pongs, relationship finalization, and rejections; queues interactive tasks; detail views for all task types (inbound/outbound requests, VRCs, pings, informational)
+- **Relationships panel** with list/detail/new-request views, inline alias editing ('e' key), R-DID privacy toggle, trust-ping with RTT latency
+- **Credentials panel** with Received/Issued tabs, raw VRC JSON in detail view, clipboard copy ('c' key), VRC request and removal
+- **Settings panel** with inline editing, config export/import, passphrase protection management, hardware token detection and factory reset
+- **VTA Service panel** showing VTA URL, DID, credential DID, key count, and backend type
+- **Logs panel** with scrollable timestamped activity log, selected entry copy ('c'), copy all ('a')
+- **Activity log panel** at bottom of screen showing real-time timestamped events (`[HH:MM:SS] message`)
+- **Status/Help panel** with DID clipboard copy hotkeys ([1] persona, [2] mediator), visual feedback on copy
+- **R-DID generation** for both BIP32 and VTA backends — VTA path authenticates and creates keys via API; both sender and receiver can use R-DIDs
+- **Dynamic R-DID listeners** — automatically added when creating R-DIDs (sender or receiver), enabling message delivery to relationship-specific DIDs
+- **VRC issuance** from inbox with DataIntegrityProof signing; **VRC rejection** with message back to requester
+- **Friendly name in relationship requests** — sender's name included in request body, auto-set as contact alias on accept, R-DID recommendation shown when sender uses one
+- **DIDComm service integration** (`affinidi-messaging-didcomm-service` 0.2) — replaces manual messaging with Router-based dispatch, automatic reconnection, message pickup, and multi-DID listener support
+- **Periodic keepalive ping** (60s) with live RTT latency in connection status header
+- **Inbox task count badge** on menu item ("Inbox (3)" in red when tasks pending)
+- **Bracketed paste** for all 21 text input fields — paste is instant regardless of string length
+- **Up/Down arrow navigation** in all multi-field forms alongside Tab
+- **Config versioning** with stepwise migration framework
+- **Panel trait** for content panels — unified render interface
+- **Outbound message retry** via `DIDCommService::send_message_with_retry`
+- **Auto-reconnect mediator** on DID change in settings
+- 15 unit tests covering core functions
+- **Contact management** actions (add/remove)
+
+### Security
+
+- Trust-pings only responded to from mediator DID or established relationships — prevents presence leakage
+- Passphrases removed from cloned State — length-only fields in UI, consumed via `mem::take`
+- Token admin PIN wrapped in `Arc<SecretString>` for shared allocation
+- Inbound message body size validation (1MB limit), task ID deduplication, sender verification
+- Collection bounds (10K tasks, 5K relationships), untrusted display text sanitization
+- Unlock rate limiting (5 attempts, exponential backoff), path redaction, file path validation
+- Key material explicit drop with documented zeroization limitation
+- Structured audit log entries for security-relevant operations
+
+### Fixed
+
+- **R-DID message routing** — acceptance, finalize, VRC, and ping messages now use relationship DID instead of persona DID when R-DID exists
+- **Config persistence** — all mutating actions save to disk
+- **Setup → main transition** — `sync_from_config()` now called after setup wizard completes
+- **VRC "From:" blank** — extract remote DID from relationship for VRC tasks
+- **Alias on accept** — sender's name set as contact alias, existing alias-less contacts updated
+- **Backspace to empty** in relationship form fields
+- **Tab after backspace fix** — dedicated `FocusField` action for field switching
+- **DIDComm listener secrets** — pass DID secrets to listeners for mediator authentication
+- All `.unwrap()`/`.expect()` replaced with proper error propagation
+- Clipboard graceful degradation, `sanitize_display` ANSI stripping order
+
+### Changed
+
+- **Workspace consolidation** — renamed the active CLI package and binary `openvtc-cli2` → `openvtc`, and renamed the supporting library `openvtc-lib` → `openvtc-core`. The unsuffixed name now belongs to the user-facing binary, matching the convention used by uv, ruff, deno, and cargo. The library is `publish = false`, so no external consumers are affected.
+- **`vta-sdk` 0.5** consumed from crates.io — dropped the temporary `../verifiable-trust-infrastructure/vta-sdk` path pin so the workspace no longer requires a sibling checkout to build.
+- **Replaced manual messaging layer** with `affinidi-messaging-didcomm-service` — deleted messaging/mod.rs (~280 lines) and outbound_queue.rs (~90 lines), added didcomm.rs (~260 lines) with Router, listeners, and send_message_with_retry
+- Grouped ~65-variant Action enum into 5 domain sub-enums
+- `tokio::sync::watch` replaces mpsc for State updates
+- Panel trait with per-panel structs implementing unified render interface
+- Dynamic DID display width (`shorten_did(did, max_width)` — 60 chars default, full if fits)
+- `Cow<str>` for zero-alloc DID truncation
+- Explicit `Arc::clone()`, `#[must_use]` on pure functions, doc comments on State types
+- `VecDeque<String>` for O(1) bounded activity log
+- `RelationshipRequestBody.name` protocol field for friendly names
+
+### Removed
+
+- **Legacy `openvtc-cli` crate** — the original prompt-driven CLI was phased out in favour of the TUI. All ongoing work lives in `openvtc`.
+- **Dead `VtaAuthenticate` setup page** — online provisioning emits `VtaAuthCompleted` directly from `VtaProvisioning`, so the legacy authenticate screen was unreachable.
+
+### Post-release deep-review pass
+
+After cutting the v0.2.0 branch a multi-axis review (code quality, security, tests, docs) flagged a set of findings that landed on the same release branch before merge. They're listed separately so the diff between v0.1.x and v0.2.0 stays readable.
+
+#### Security
+
+- **Per-entry random Argon2 salt with transparent v1→v2 migration.** `derive_passphrase_key` previously used a deterministic salt = SHA-256(info), so two operators with the same passphrase produced the same KEK and exported backups were byte-comparable. The new `passphrase_encrypt_v2` / `passphrase_decrypt` API in `openvtc-core::config::secured_config` writes a magic-prefixed `[OPV2 | salt(16) | nonce(12) | ct+tag]` blob with a fresh random salt; the decrypt path auto-detects v1/v2 so existing exports keep opening. Argon2id parameters bumped to OWASP "high-value KEK" floor (m=128 MiB, t=4, p=1).
+- **`did-git-sign` signing policy.** The proxy now refuses to sign unless the parent process name starts with `git` or `ssh-keygen`, and writes every signing attempt — accepted or denied — to `~/.config/did-git-sign/audit.log` (mode 0600) with parent PID/name, namespace, buffer path and SHA-256. Blocks the "malicious build script obtains a signature with namespace=git over attacker-chosen content" pivot.
+- **DIDComm replay window + seen-message LRU** in `process_inbound_message`: drop messages with `created_time` outside ±48h / +5m skew, drop messages whose `expires_time` already passed, dedupe on a 1024-entry process-lifetime ID LRU.
+- **DID validation** uses a real W3C DID Core 1.0 syntax parser instead of a `did:` prefix check; rejects bidi-override / zero-width chars in DID fields.
+- **Inbox display-name sanitisation** strips bidi-override / isolate / zero-width / BOM unicode (Cf class) plus ANSI escapes / control chars, and clamps inbound contact aliases to 64 chars before persistence.
+- **Bounded DIDComm event channel** (256-entry capacity) so a noisy mediator can't grow memory without limit; overflow logs and drops, mediator pickup redelivers when we drain.
+- **`did.jsonl` write path** is now the resolved profile dir, not the current working directory.
+- **Dependabot:** transitive openssl/rustls-webpki/rand bumped via `cargo update` to clear nine open advisories. `pgp` was already at the patched 0.19.
+- **Tagged-variant downgrade defence on `SecuredConfigFormat`.** Switched the on-disk variant tag from `#[serde(untagged)]` to `#[serde(tag = "format")]` so every blob carries an explicit `"format"` discriminator. Without it, an attacker with write access to the OS keychain could substitute a `PasswordEncrypted` blob with `{"text": "<plaintext>"}` and serde would silently match it as `PlainText`, bypassing AES-256-GCM. New `assert_format_matches_intent` cross-validation gate adds a second defence layer — a tagged-but-weaker blob is rejected before any decrypt or re-save. Old (untagged) blobs migrate transparently on first load. Folded from @ojasshelke's PR #34; the PR's HKDF v2 fixed-salt variant is superseded by our random-per-entry-salt v2 (`OPV2` magic prefix) above.
+
+#### Community contributions
+
+Three community PRs against `main` were assessed and folded into the release. Each PR's substantive value is preserved with `Co-authored-by:` trailers; the corresponding PRs are closed with a comment pointing here.
+
+- **#57 — profile-name validation hardening (@sameerchore).** `validate_profile_name` now trims leading/trailing whitespace before validating, and the empty/whitespace check runs before the character check (so `"   "` gets a clear "cannot be empty or contain only whitespace" error instead of the confusing "Invalid profile name '   '"). Three new integration tests pin the behaviour.
+- **#51 — cross-platform config paths (@krsatyamthakur-droid, closes #47).** `profile_dir` and `get_lock_file` now use `dirs::config_dir()` on Windows (typically `%APPDATA%\openvtc`); Unix/macOS continues to use `~/.config/openvtc/` so existing installs don't move. `get_config_path` and `get_lock_file` return `PathBuf` instead of `String` end-to-end.
+- **#34 — `SecuredConfig` serde-format hardening (@ojasshelke).** Tagged-variant downgrade defence + intent-gate cross-validation, described under Security above. The PR's HKDF v2 fixed-salt scheme was superseded by our random-salt OPV2 v2 and intentionally not folded.
+
+#### Architecture & code quality
+
+- **State-handler split.** `state_handler/mod.rs` was 2,255 lines with a 500-line `tokio::select!` arm; it's now 813 lines (-64%). Each per-domain match (Inbox, Relationship, Credential, Settings, Contact) was extracted to a `dispatch(action, ctx).await` entry point in the corresponding sub-module.
+- **Layering:** moved `colors.rs` and the `dialoguer` passphrase prompt out of `openvtc-core` so the daemon (`openvtc-service`) and automation (`robotic-maintainers`) crates no longer pull in `ratatui` + `dialoguer` transitively.
+- **Lifted four DID-truncation helpers** into a single `openvtc-core::display` module (`truncate_did`, `truncate_did_centered`).
+- **Tightened `openvtc-core` public surface** — dropped a dead `pub use` re-export and scoped two helpers to `pub(crate)`.
+- **Fixed silent failures** in the state handler: surfaced previously-swallowed `save_config` / `remove_listener` / inbox-task errors via `log_error`. Replaced four `.expect("valid route")` panics in DIDComm router init with `?`. Replaced `panic!("Cannot create log file …")` with stderr + continue.
+- **Fixed DIDComm-only VTA fallback** in `relationships.rs` (used `build_runtime_vta_client` instead of REST-only `challenge_response`).
+
+#### Tests & CI
+
+- **In-process mediator harness** (`openvtc-core/tests/common/mod.rs`): wraps the upstream `affinidi-messaging-test-mediator` 0.2 fixture via `TestMediator::with_users(["alice", "bob"])`, which boots a real `affinidi-messaging-mediator` on an ephemeral loopback port (memory-backed store, generated `did:peer` identity advertising `dm`/`#auth`/`#ws`, Ed25519 JWT signing keypair) and returns Alice + Bob as ALLOW_ALL accounts whose DIDComm service URI is the mediator's DID — the routing/2.0 shape required for forwards to short-circuit to local delivery instead of being enqueued for external forwarding. The previous in-tree harness predated the test-mediator crate; the migration drops ~400 lines of fixture code and four dev-deps (`affinidi-messaging-mediator`, `-mediator-common`, `-sdk`, `sha256`).
+- **End-to-end integration tests** (`relationship_e2e.rs`): drive a real Alice→Mediator→Bob DIDComm round-trip, a production `RelationshipRequestBody` round-trip, and a two-leg VRC request/reject round-trip — all in ~350ms once the mediator is up. Plus a smoke test (`mediator_smoke.rs`) that asserts the well-known endpoint serves a DID Document. Marked `#[ignore]` (each spawns the mediator, ~1s); CI's coverage job runs them with `--include-ignored`.
+- **38 new unit tests** across `setup_flow/navigation` (25 table-driven), BIP32 derivation (7 known-answer vectors), AES-GCM tampering (6) — locking the wizard flow, derivation contract, and AEAD failure modes before the v0.3.0 work begins.
+- **CI** adds a `cargo-deny` job (advisories + licenses + bans + sources, with documented `RUSTSEC-2023-0071` rsa Marvin-Attack and `RUSTSEC-2024-0370` proc-macro-error ignores) and a `cargo-llvm-cov` coverage job (uploads `lcov.info` artifact, runs ignored tests). MSRV check bumped 1.91 → 1.94 to match `Cargo.toml`.
+
+#### Dependency refresh
+
+Picks up the May 2026 Affinidi-stack releases. All bumps cleared on crates.io; build, full test suite, and integration tests pass.
+
+- **`affinidi-tdk` 0.6 → 0.7** — accessor-method API on `TDKSharedState`/`TDKEnvironment`/`TDKProfile`. Field accesses (`.secrets_resolver`, `.environment`, `.profiles`, `.default_mediator`, `.ssl_certificate_paths`) are now method calls. `TDKSharedState::default().await` (removed in tdk 0.6) replaced with `TDKSharedState::new(TDKConfig::headless()?).await?` in `openvtc-service`.
+- **`affinidi-messaging-didcomm-service` 0.2 → 0.3** — version bump driven by the upstream `MediatorACLSet` error-type relocation; downstream impact is `?`-transparent thanks to `From<ACLError> for ATMError`.
+- **`affinidi-messaging-test-mediator` 0.1 → 0.2** (dev-deps only) — `TestMediator::with_users(["alice", "bob"])` replaces our hand-rolled `MemoryStore` + ALLOW_ALL registration dance. Drops `affinidi-messaging-mediator`, `-mediator-common`, `-sdk` and `sha256` from dev-deps.
+- Working with the upstream maintainers, this branch's review of the May 2026 test-mediator changes also surfaced two follow-ups landing post-publication: an IPv6 routing-classification fix and `mediator-common` feature-gating to keep the SDK light. Neither is on the path used by openvtc tests (loopback over `127.0.0.1`).
+
+#### Docs
+
+- README, CONTRIBUTING, SECURITY, CLAUDE.md aligned to the post-rename workspace shape (`openvtc` binary + `openvtc-core` lib).
+- CHANGELOG `[0.2.0]` entry above describes the release as it actually shipped.
+
 ## [0.1.5] - 2026-04-14
 
 ### Security

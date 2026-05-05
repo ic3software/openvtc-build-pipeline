@@ -1,6 +1,6 @@
 # Open Verifiable Trust Community (OpenVTC) with First Person Protocol
 
-[![Rust](https://img.shields.io/badge/rust-1.91.0%2B-blue.svg?maxAge=3600)](https://github.com/OpenVTC/openvtc)
+[![Rust](https://img.shields.io/badge/rust-1.94.0%2B-blue.svg?maxAge=3600)](https://github.com/OpenVTC/openvtc)
 
 A CLI tool for establishing verifiable trust relationships within developer
 communities using Decentralised Identifiers (DIDs) and Verifiable Credentials
@@ -15,9 +15,8 @@ Personhood Credentials (PHCs) and Verifiable Relationship Credentials (VRCs).
 
 | Crate | Description |
 |-------|-------------|
-| `openvtc-cli` | Original CLI tool with interactive setup wizard |
-| `openvtc-cli2` | TUI-based CLI with ratatui interface |
-| `openvtc-lib` | Shared library for configuration, DID management, and crypto |
+| `openvtc` | TUI-based CLI with ratatui interface |
+| `openvtc-core` | Shared library for configuration, DID management, and crypto |
 | `openvtc-service` | Background service for DIDComm messaging |
 | `did-git-sign` | [Git commit signing proxy](./did-git-sign/) using DID Ed25519 keys via VTA |
 | `robotic-maintainers` | Automated VRC issuance for robotic maintainers |
@@ -202,7 +201,7 @@ For more details, refer to the [Secured Configuration Management](./docs/secured
 
 ## Prerequisites
 
-1. Rust version 1.91.0 or higher (Install [Rust](https://rust-lang.org/learn/get-started/))
+1. Rust version 1.94.0 or higher (Install [Rust](https://rust-lang.org/learn/get-started/))
 2. Publicly accessible domain to host your DID document.
 3. **Optional:** DIDComm mediator to send messages. OpenVTC provides a default DIDComm mediator.
 4. **Optional:** Set environment variables.
@@ -232,10 +231,10 @@ This repository is a Cargo workspace. The root `Cargo.toml` defines the followin
 
 | Crate | Role |
 |---|---|
-| `openvtc-lib` | Core library — config, storage, cryptography, DID logic |
-| `openvtc-cli` | Primary command-line interface |
-| `openvtc-cli2` | Terminal UI (TUI) interface |
+| `openvtc-core` | Core library — config, storage, cryptography, DID logic |
+| `openvtc` | Terminal UI (TUI) interface |
 | `openvtc-service` | Background service component |
+| `did-git-sign` | Git commit signing proxy using DID Ed25519 keys |
 | `robotic-maintainers` | Automated maintenance tooling |
 
 ### Building
@@ -261,7 +260,7 @@ cargo test
 For a specific crate:
 
 ```bash
-cargo test -p openvtc-lib
+cargo test -p openvtc-core
 ```
 
 ### PR Guidelines

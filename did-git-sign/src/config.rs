@@ -2,7 +2,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-const KEYRING_SERVICE: &str = "did-git-sign";
+/// Keyring service name under which all `did-git-sign` credentials are
+/// stored. `pub(crate)` so the `init::uninstall` helper can look up the
+/// same entries to remove them.
+pub(crate) const KEYRING_SERVICE: &str = "did-git-sign";
 
 /// Configuration stored in .did-git-sign.json
 ///
@@ -10,7 +13,13 @@ const KEYRING_SERVICE: &str = "did-git-sign";
 /// All VTA credentials and key identifiers are stored in the OS keyring.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SigningConfig {
-    /// The DID#key-id to use as git user.email (e.g., did:webvh:abc:example.com#key-0)
+    /// The signing DID + key fragment, e.g. `did:webvh:abc:example.com#key-0`.
+    ///
+    /// This is the public identity recorded in the SSH signature's
+    /// `Signed-By` principal (via `allowed_signers`); it is **not** written
+    /// to git's `user.email`. Setup deliberately leaves `user.email` alone
+    /// so a DID-shaped value doesn't collide with real email-shaped expectations
+    /// in third-party tooling.
     pub did_key_id: String,
     /// Git user.name to set during init
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20,7 +29,8 @@ pub struct SigningConfig {
 /// VTA credentials and key configuration stored securely in the OS keyring.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VtaCredentials {
-    /// VTA service URL
+    /// VTA service URL. May be empty for DIDComm-only VTAs (in which case
+    /// `mediator_did` must be set).
     pub vta_url: String,
     /// VTA DID
     pub vta_did: String,
@@ -30,6 +40,15 @@ pub struct VtaCredentials {
     pub private_key_multibase: String,
     /// VTA key ID for the Ed25519 signing key
     pub key_id: String,
+    /// DIDComm mediator DID advertised by the VTA. When set, `did-git-sign`
+    /// authenticates by opening a DIDComm session against this mediator
+    /// instead of running REST challenge-response — required for VTAs that
+    /// don't expose a REST endpoint.
+    ///
+    /// `#[serde(default)]` keeps existing pre-DIDComm keyring entries
+    /// loadable as REST-only configs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mediator_did: Option<String>,
 }
 
 impl SigningConfig {
@@ -69,7 +88,7 @@ impl SigningConfig {
 pub fn store_vta_credentials(did_key_id: &str, creds: &VtaCredentials) -> Result<()> {
     let key = format!("{did_key_id}:vta");
     let value = serde_json::to_string(creds)?;
-    let entry = keyring::Entry::new(KEYRING_SERVICE, &key)
+    let entry = keyring_core::Entry::new(KEYRING_SERVICE, &key)
         .context("failed to create keyring entry for VTA credentials")?;
     entry
         .set_password(&value)
@@ -80,8 +99,8 @@ pub fn store_vta_credentials(did_key_id: &str, creds: &VtaCredentials) -> Result
 /// Retrieve VTA credentials from the OS keyring.
 pub fn load_vta_credentials(did_key_id: &str) -> Result<VtaCredentials> {
     let key = format!("{did_key_id}:vta");
-    let entry =
-        keyring::Entry::new(KEYRING_SERVICE, &key).context("failed to create keyring entry")?;
+    let entry = keyring_core::Entry::new(KEYRING_SERVICE, &key)
+        .context("failed to create keyring entry")?;
     let data = entry
         .get_password()
         .context("VTA credentials not found in keyring — run `did-git-sign init` first")?;
@@ -95,8 +114,8 @@ pub fn cache_token(did_key_id: &str, token: &str, expires_at: u64) -> Result<()>
         "access_token": token,
         "access_expires_at": expires_at,
     });
-    let entry =
-        keyring::Entry::new(KEYRING_SERVICE, &key).context("failed to create token cache entry")?;
+    let entry = keyring_core::Entry::new(KEYRING_SERVICE, &key)
+        .context("failed to create token cache entry")?;
     entry
         .set_password(&value.to_string())
         .context("failed to cache token in keyring")?;
@@ -106,7 +125,7 @@ pub fn cache_token(did_key_id: &str, token: &str, expires_at: u64) -> Result<()>
 /// Load a cached VTA access token if it is still valid.
 pub fn load_cached_token(did_key_id: &str) -> Option<String> {
     let key = format!("{did_key_id}:token");
-    let entry = keyring::Entry::new(KEYRING_SERVICE, &key).ok()?;
+    let entry = keyring_core::Entry::new(KEYRING_SERVICE, &key).ok()?;
     let data = entry.get_password().ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&data).ok()?;
 
@@ -206,6 +225,7 @@ mod tests {
             credential_did: "did:key:z6Mk123".to_string(),
             private_key_multibase: "z1234".to_string(),
             key_id: "key-1".to_string(),
+            mediator_did: None,
         };
         let json = serde_json::to_string(&creds).unwrap();
         let parsed: VtaCredentials = serde_json::from_str(&json).unwrap();

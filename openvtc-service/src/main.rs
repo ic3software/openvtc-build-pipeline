@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use affinidi_tdk::{
-    common::TDKSharedState,
+    common::{TDKSharedState, config::TDKConfig},
     didcomm::Message,
     messaging::messages::compat::UnpackMetadata,
     messaging::{ATM, config::ATMConfig, profiles::ATMProfile},
@@ -11,7 +11,7 @@ use affinidi_tdk::{
 };
 use anyhow::{Result, bail};
 use clap::Parser;
-use openvtc::{MessageType, maintainers::create_send_maintainers_list, protocol_urls};
+use openvtc_core::{MessageType, maintainers::create_send_maintainers_list, protocol_urls};
 use tracing::{info, warn};
 use tracing_subscriber::filter;
 
@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
     // Create a basic ATM instance
     let atm = ATM::new(
         ATMConfig::builder().build()?,
-        Arc::new(TDKSharedState::default().await),
+        Arc::new(TDKSharedState::new(TDKConfig::headless()?).await?),
     )
     .await?;
 
@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
 
     // Add secrets to ATM
     atm.get_tdk()
-        .secrets_resolver
+        .secrets_resolver()
         .insert_vec(&config.secrets)
         .await;
 
@@ -148,7 +148,7 @@ async fn handle_message(
         bail!("Couldn't get a valid to: address from message");
     };
 
-    let from_did = match openvtc::require_from(msg) {
+    let from_did = match openvtc_core::require_from(msg) {
         Ok(did) => did,
         Err(_) => {
             warn!("Message received had no from: address! Ignoring...");

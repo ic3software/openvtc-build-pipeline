@@ -4,7 +4,6 @@
 use affinidi_tdk::{
     TDK,
     common::config::TDKConfig,
-    data_integrity::DataIntegrityProof,
     didcomm::Message,
     messaging::messages::compat::UnpackMetadata,
     messaging::{
@@ -22,7 +21,7 @@ use std::{collections::HashMap, env, sync::Arc};
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use openvtc::{
+use openvtc_core::{
     MessageType, protocol_urls,
     relationships::{
         RelationshipRequestBody, create_send_message_accepted, create_send_message_rejected,
@@ -92,18 +91,18 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    let environment = &tdk.get_shared_state().environment;
+    let environment = tdk.shared().environment();
     let Some(mut inbound_channel) = atm.get_inbound_channel() else {
         bail!("Couldn't get ATM aggregated inbound channel");
     };
 
-    let Some(mediator_did) = &environment.default_mediator else {
+    let Some(mediator_did) = environment.default_mediator() else {
         println!("There is no default mediator set in the TDK environment configuration!");
         bail!("No default mediator!");
     };
 
     // Activate Ada Profile
-    let tdk_ada = if let Some(ada) = environment.profiles.get("Ada") {
+    let tdk_ada = if let Some(ada) = environment.profiles().get("Ada") {
         tdk.add_profile(ada).await;
         ada
     } else {
@@ -116,7 +115,7 @@ async fn main() -> Result<()> {
     info!("{} profile loaded", atm_ada.inner.alias);
 
     // Activate Alan Profile
-    let tdk_alan = if let Some(alan) = environment.profiles.get("Alan") {
+    let tdk_alan = if let Some(alan) = environment.profiles().get("Alan") {
         tdk.add_profile(alan).await;
         alan
     } else {
@@ -129,7 +128,7 @@ async fn main() -> Result<()> {
     info!("{} profile loaded", atm_alan.inner.alias);
 
     // Activate Grace Profile
-    let tdk_grace = if let Some(grace) = environment.profiles.get("Grace") {
+    let tdk_grace = if let Some(grace) = environment.profiles().get("Grace") {
         tdk.add_profile(grace).await;
         grace
     } else {
@@ -142,7 +141,7 @@ async fn main() -> Result<()> {
     info!("{} profile loaded", atm_grace.inner.alias);
 
     // Activate Charles Profile
-    let tdk_charles = if let Some(charles) = environment.profiles.get("Charles") {
+    let tdk_charles = if let Some(charles) = environment.profiles().get("Charles") {
         tdk.add_profile(charles).await;
         charles
     } else {
@@ -224,7 +223,7 @@ async fn handle_message(
         );
     }
 
-    let from_did = match openvtc::require_from(message) {
+    let from_did = match openvtc_core::require_from(message) {
         Ok(did) => did,
         Err(_) => {
             warn!(
@@ -457,7 +456,7 @@ async fn create_vrc(
 
     let Some(secret) = atm
         .get_tdk()
-        .secrets_resolver
+        .secrets_resolver()
         .get_secret([&profile.inner.did, "#key-0"].concat().as_str())
         .await
     else {
@@ -465,8 +464,7 @@ async fn create_vrc(
         bail!("Couldn't find secret");
     };
 
-    let proof = DataIntegrityProof::sign_jcs_data(&vrc, None, &secret, None).await?;
-    vrc.credential_mut().proof = Some(proof);
+    vrc.sign(&secret, None).await?;
 
     Ok(vrc)
 }

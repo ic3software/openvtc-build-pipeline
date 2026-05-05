@@ -1,54 +1,62 @@
 [workspace]
 members = [
-  "openvtc-lib",
-  "openvtc-cli",
+  "openvtc-core",
   "robotic-maintainers",
   "openvtc-service",
-  "openvtc-cli2",
+  "openvtc",
   "did-git-sign",
 ]
 resolver = "3"
 
 [workspace.package]
 description = "Open Verifiable Trust Community (OpenVTC) - First Person Protocol"
-version = "0.1.5"
+version = "0.2.0"
 edition = "2024"
 publish = false
 authors = ["Glenn Gore <glenn@affinidi.com>"]
-rust-version = "1.91.0"
+rust-version = "1.94.0"
 readme = "README.md"
 license = "Apache-2.0"
 repository = "https://github.com/LF-Decentralized-Trust-labs/openvtc"
 
 [workspace.dependencies]
-openvtc = { version = "0.1", path = "openvtc-lib", default-features = false }
+openvtc-core = { version = "0.2", path = "openvtc-core", default-features = false }
 
 # Decentralized Trust Graph Credentials
 dtg-credentials = "0.1"
 
 aes-gcm = "0.10"
 argon2 = "0.5"
-affinidi-tdk = "0.6"
-affinidi-data-integrity = "0.5"
+affinidi-tdk = "0.7"
+affinidi-data-integrity = "0.6"
+affinidi-messaging-didcomm-service = "0.3"
 anyhow = "1.0"
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 base64 = "0.22"
 bip39 = "2.2"
 byteorder = "1.5"
 chrono = "0.4"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 console = "0.16"
 crossterm = { version = "0.29", features = ["event-stream"] }
 dirs = "6.0"
 dialoguer = { version = "0.12", features = ["password"] }
-didwebvh-rs = "0.4"
+didwebvh-rs = "0.5"
 ed25519-dalek-bip32 = "0.3"
-hkdf = "0.12"
+hkdf = "0.13"
 hex = "0.4"
-keyring = "3.6"
+# keyring split: the library API is now in keyring-core 1.0; platform
+# backends ship as separate keyring-store crates that each binary registers
+# at startup via keyring_core::set_default_store.
+keyring-core = "1"
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+linux-keyutils-keyring-store = "1"
+windows-native-keyring-store = "1"
 multibase = "0.9"
 pgp = "0.19"
-# Locked to 0.8 — aes-gcm 0.10 depends on rand_core 0.6 (rand 0.8), not 0.9 (rand 0.10)
+# Stays on 0.8 until pgp 0.19 / aes-gcm 0.10 / ed25519-dalek-bip32 0.3
+# move off rand_core 0.6 — they all sit on the old trait set and rand 0.10
+# drops `OsRng`. Bump together when the crypto stack is refreshed.
 rand = "0.8"
 ratatui = "0.30"
 regex = "1.12"
@@ -56,24 +64,24 @@ secrecy = { version = "0.10", features = ["serde"] }
 serde = "1.0"
 serde_json = "1.0"
 serde_json_canonicalizer = "0.3"
-# Locked to 0.10 — aes-gcm 0.10 uses digest 0.10 ecosystem (sha2 0.10), not 0.11
-sha2 = "0.10"
+sha2 = "0.11"
 strum = "0.28"
 strum_macros = "0.28"
 sysinfo = "0.38"
 thiserror = "2.0"
-tokio = "1.49"
+tokio = "1.52"
 tokio-stream = "0.1"
+tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tui-input = "0.15"
 url = "2.5"
-uuid = { version = "1.20", features = ["v4", "fast-rng"] }
-vta-sdk = { version = "0.3", features = [
+uuid = { version = "1.23", features = ["v4", "fast-rng"] }
+vta-sdk = { version = "0.5", features = [
   "session",
   "client",
   "didcomm",
-  "keyring",
+  "provision-client",
 ] }
 reqwest = { version = "0.13", features = ["json"] }
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
