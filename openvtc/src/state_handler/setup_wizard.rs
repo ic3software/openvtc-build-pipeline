@@ -29,7 +29,17 @@ impl StateHandler {
 
         // Holder for the created config
         let mut config: Option<Config> = None;
-        let exit = loop {
+        // The single admin VTA session: opened once at provisioning (after the
+        // ephemeral→admin DID swap) and reused by every subsequent VTA step, so
+        // the admin DID holds ONE mediator connection for the whole flow rather
+        // than a fresh WebSocket per call (which churns the mediator's
+        // one-socket-per-DID policy and drops in-flight responses). Shut down
+        // once when the wizard exits (below).
+        let mut admin_client: Option<vta_sdk::client::VtaClient> = None;
+        // Wrapped so the admin session is torn down on EVERY exit — including a
+        // `?` error out of a handler below — and never leaks (the LeakGuard).
+        let exit: Result<SetupWizardExit> = async {
+            Ok(loop {
             let _ = self.state_tx.send(state.clone());
             tokio::select! {
             Some(action) = action_rx.recv() => match action {
@@ -85,10 +95,14 @@ impl StateHandler {
                     setup_vta_actions::handle_vta_submit_did(state, &self.state_tx, vta_did).await?;
                 },
                 Action::VtaStartProvision(context_id) => {
-                    setup_vta_actions::handle_vta_start_provision(state, &self.state_tx, context_id).await?;
+                    // Close any prior admin session before re-provisioning.
+                    if let Some(c) = admin_client.take() {
+                        c.shutdown().await;
+                    }
+                    admin_client = setup_vta_actions::handle_vta_start_provision(state, &self.state_tx, context_id).await?;
                 },
                 Action::VtaCreateKeys
-                    if setup_vta_actions::handle_vta_create_keys(state, &self.state_tx).await? =>
+                    if setup_vta_actions::handle_vta_create_keys(state, &self.state_tx, admin_client.as_ref()).await? =>
                 {
                     continue;
                 },
@@ -122,18 +136,18 @@ impl StateHandler {
                 Action::SetTokenName(token, name) => {
                     setup_token_actions::handle_set_token_name(state, &self.state_tx, token, &name);
                 },
-                Action::WebvhServerCreateDid(server_id, custom_path) => {
+                Action::WebvhServerCreateDid(server_id, path_mode) => {
                     // Cannot move owned bound vars into a match guard, so the
                     // collapsible_match form clippy suggests doesn't compile.
                     #[allow(clippy::collapsible_match)]
-                    if setup_did_actions::handle_webvh_server_create_did(state, &self.state_tx, tdk, server_id, custom_path).await? {
+                    if setup_did_actions::handle_webvh_server_create_did(state, &self.state_tx, tdk, admin_client.as_ref(), server_id, path_mode).await? {
                         continue;
                     }
                 },
                 Action::SetCustomMediator(mediator_did) => {
                     state.setup.custom_mediator = Some(mediator_did.clone());
                     if state.setup.vta.use_webvh_server {
-                        if setup_did_actions::handle_custom_mediator_webvh(state, &self.state_tx, tdk).await? {
+                        if setup_did_actions::handle_custom_mediator_webvh(state, &self.state_tx, tdk, admin_client.as_ref()).await? {
                             continue;
                         }
                     } else {
@@ -161,25 +175,28 @@ impl StateHandler {
                 Action::ResolveWebVHDID(did) => {
                     setup_did_actions::handle_resolve_webvh_did(state, tdk, did).await;
                 },
-                Action::SetupCompleted(setup_flow) => {
+                Action::SetupCompleted(_setup_flow) => {
                     state.setup.active_page = SetupPage::FinalPage;
                     // The armored private-key block is no longer needed once we
                     // leave the export page; drop it so it stops being cloned
                     // out on every state broadcast.
                     state.setup.did_keys_export.exported = None;
-                    state.setup.final_page.messages.push(MessageType::Info("Generating your profile configuration...".to_string()));
+                    state.setup.final_page.messages.push(MessageType::Info("Creating your account configuration...".to_string()));
                     state.setup.final_page.messages.push(MessageType::Info("Securing sensitive data for storage...".to_string()));
                     state.setup.final_page.messages.push(MessageType::Info("Your device may prompt for authentication to access OS secure storage.".to_string()));
                     let _ = self.state_tx.send(state.clone());
-                    match Config::create(&state.setup, &setup_flow, tdk, &self.profile).await {
+                    // R-A-5: setup now bootstraps a State-A account (VTA admin
+                    // credential + top-level context, no persona/community). A
+                    // persona is minted later by the State-B join flow.
+                    match Config::create_account(&state.setup, &self.profile).await {
                         Ok(cfg) => {
                             state.setup.final_page.completed = Completion::CompletedOK;
-                            state.setup.final_page.messages.push(MessageType::Info("Profile setup completed successfully.".to_string()));
+                            state.setup.final_page.messages.push(MessageType::Info("Account setup completed successfully.".to_string()));
                             config = Some(cfg);
                         },
                         Err(e) => {
                             state.setup.final_page.completed = Completion::CompletedFail;
-                            state.setup.final_page.messages.push(MessageType::Error(format!("Couldn't create OpenVTC configuration. Reason: {e}")));
+                            state.setup.final_page.messages.push(MessageType::Error(format!("Couldn't create OpenVTC account. Reason: {e}")));
                         }
                     }
                 },
@@ -190,8 +207,17 @@ impl StateHandler {
                     break SetupWizardExit::Interrupted(interrupted);
                 }
             }
-        };
+            })
+        }
+        .await;
 
-        Ok(exit)
+        // Tear down the single admin VTA session now that setup is over (no-op
+        // for the REST transport). This is the one place the wizard's session is
+        // closed — every VTA step above reused it without opening its own.
+        if let Some(c) = admin_client {
+            c.shutdown().await;
+        }
+
+        exit
     }
 }

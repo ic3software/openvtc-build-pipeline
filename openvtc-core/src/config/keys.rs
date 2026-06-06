@@ -64,7 +64,10 @@ impl Config {
     /// Returns an error if the DID document is missing any required verification
     /// method, or if the corresponding secret or key info cannot be found.
     pub async fn get_persona_keys(&self, tdk: &TDK) -> Result<PersonaDIDKeys, OpenVTCError> {
-        let doc = &self.persona_did.document;
+        let doc = self
+            .active_identity()
+            .ok_or_else(|| OpenVTCError::Config("No active persona identity".to_string()))?
+            .document();
         let signing = resolve_key_from_document(
             &doc.assertion_method,
             "assertion methods",
@@ -95,8 +98,23 @@ impl Config {
     /// DIDComm service can authenticate with the mediator. On normal startup
     /// this is done by `load_step2`.
     pub async fn load_persona_secrets(&self, tdk: &TDK) -> Result<(), OpenVTCError> {
+        // Open ONE VTA admin session up front and reuse it for every VtaManaged
+        // key below, instead of connecting (and tearing down) a fresh mediator
+        // session per key.
+        let vta_client = if matches!(&self.key_backend, KeyBackend::Vta { .. }) {
+            super::build_runtime_vta_client(&self.key_backend)
+                .await
+                .ok()
+        } else {
+            None
+        };
+
+        // PERF: VtaManaged `get_key_secret` calls stay sequential — see the note
+        // in `regenerate_persona_keys`: concurrent fetches on a single
+        // DIDComm-backed session race on the shared live-stream cursor and can
+        // drop each other's responses.
         for (key_id, key_info) in &self.key_info {
-            if !key_id.starts_with(self.public.persona_did.as_str()) {
+            if !key_id.starts_with(self.persona_did()) {
                 continue;
             }
             let kp = match key_info.purpose {
@@ -104,53 +122,54 @@ impl Config {
                 KeyTypes::PersonaEncryption => KeyPurpose::Encryption,
                 _ => continue,
             };
-            let secret =
-                match &key_info.path {
-                    KeySourceMaterial::Derived { path } => {
-                        let KeyBackend::Bip32 { root, .. } = &self.key_backend else {
-                            continue;
-                        };
-                        root.get_secret_from_path(path, kp)
-                            .map(|mut s| {
-                                s.id = key_id.clone();
-                                s
-                            })
+            let secret = match &key_info.path {
+                KeySourceMaterial::Derived { path } => {
+                    let KeyBackend::Bip32 { root, .. } = &self.key_backend else {
+                        continue;
+                    };
+                    root.get_secret_from_path(path, kp)
+                        .map(|mut s| {
+                            s.id = key_id.clone();
+                            s
+                        })
+                        .ok()
+                }
+                KeySourceMaterial::Imported { seed } => {
+                    use secrecy::ExposeSecret;
+                    Secret::from_multibase(seed.expose_secret(), None)
+                        .map(|mut s| {
+                            s.id = key_id.clone();
+                            s
+                        })
+                        .ok()
+                }
+                KeySourceMaterial::VtaManaged { key_id: vta_key_id } => {
+                    if let Some(client) = vta_client.as_ref() {
+                        client
+                            .get_key_secret(vta_key_id)
+                            .await
                             .ok()
-                    }
-                    KeySourceMaterial::Imported { seed } => {
-                        use secrecy::ExposeSecret;
-                        Secret::from_multibase(seed.expose_secret(), None)
-                            .map(|mut s| {
-                                s.id = key_id.clone();
-                                s
-                            })
-                            .ok()
-                    }
-                    KeySourceMaterial::VtaManaged { key_id: vta_key_id } => {
-                        if matches!(&self.key_backend, KeyBackend::Vta { .. }) {
-                            match super::build_runtime_vta_client(&self.key_backend).await {
-                                Ok(client) => client
-                                    .get_key_secret(vta_key_id)
-                                    .await
+                            .and_then(|resp| {
+                                secret_from_vta_response(&resp, kp)
+                                    .map(|mut s| {
+                                        s.id = key_id.clone();
+                                        s
+                                    })
                                     .ok()
-                                    .and_then(|resp| {
-                                        secret_from_vta_response(&resp, kp)
-                                            .map(|mut s| {
-                                                s.id = key_id.clone();
-                                                s
-                                            })
-                                            .ok()
-                                    }),
-                                Err(_) => None,
-                            }
-                        } else {
-                            None
-                        }
+                            })
+                    } else {
+                        None
                     }
-                };
+                }
+            };
             if let Some(s) = secret {
                 tdk.get_shared_state().secrets_resolver().insert(s).await;
             }
+        }
+
+        // Close the single shared session now that all keys are loaded.
+        if let Some(client) = vta_client {
+            client.shutdown().await;
         }
         Ok(())
     }
@@ -168,7 +187,21 @@ impl Config {
         doc: &Document,
         vta_client: Option<&vta_sdk::client::VtaClient>,
     ) -> Result<(), OpenVTCError> {
-        // Rehydrate DID keys referenced by Verification Methods in the DID Document
+        // Rehydrate DID keys referenced by Verification Methods in the DID
+        // Document.
+        //
+        // PERF: the VtaManaged `get_key_secret` round-trips below are kept
+        // SEQUENTIAL on purpose. When `vta_client` is DIDComm-backed (the
+        // default for a VTA backend), all cloned `VtaClient`s share ONE
+        // `Arc<ATM>`/`Arc<ATMProfile>` and therefore ONE WebSocket live-stream
+        // cursor. `vta_sdk`'s `send_and_wait` reads that cursor with
+        // `live_stream_next` and DROPS (`continue`) any message whose `thid`
+        // doesn't match the request it is waiting on — so two concurrent
+        // fetches on the same session race: one can consume and discard the
+        // other's response, making that fetch time out. Parallelising here
+        // would risk dropped persona keys at startup. (REST-backed sessions
+        // would be safe, but the transport isn't known here.) See
+        // `vta-sdk/src/didcomm_session.rs::send_and_wait`.
         for vm in &doc.verification_method {
             let Some(kp) = sc.key_info.get(vm.id.as_str()) else {
                 warn!(

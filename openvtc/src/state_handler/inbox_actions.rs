@@ -33,6 +33,7 @@ pub async fn accept_relationship_request(
     service: &DIDCommService,
     task_id: &str,
     generate_r_did: bool,
+    admin_vta: Option<&vta_sdk::client::VtaClient>,
 ) -> Result<()> {
     let task_id = Arc::new(task_id.to_string());
 
@@ -70,13 +71,11 @@ pub async fn accept_relationship_request(
     // from/to so the mediator can route them and sender validation is simple.
     // The R-DID listener is registered for post-establishment communication.
     let our_did = if generate_r_did {
+        // Snapshot the mediator before the &mut config borrow below.
+        let mediator = config.mediator_did().to_string();
         let r_did = Arc::new(
-            super::relationship_actions::create_relationship_did(
-                tdk,
-                config,
-                &config.public.mediator_did.clone(),
-            )
-            .await?,
+            super::relationship_actions::create_relationship_did(tdk, config, &mediator, admin_vta)
+                .await?,
         );
         // Register listener for post-establishment use (no need to wait for connection)
         let listener_config = super::didcomm::relationship_listener_config(
@@ -84,7 +83,7 @@ pub async fn accept_relationship_request(
             tdk,
             &r_did,
             &from_did,
-            &config.public.mediator_did,
+            config.mediator_did(),
         )
         .await;
         if let Err(e) = service.add_listener(listener_config).await {
@@ -92,7 +91,7 @@ pub async fn accept_relationship_request(
         }
         r_did
     } else {
-        Arc::clone(&config.public.persona_did)
+        config.persona_did_arc()
     };
 
     // Add or update contact with sender's name as alias
@@ -134,12 +133,12 @@ pub async fn accept_relationship_request(
     // The R-DID is carried in the body — the mediator only sees persona DIDs.
     // from/to use persona DIDs so encryption keys match the persona listener.
     let msg = build_accept_message(
-        &config.public.persona_did, // from: our persona
-        &from_did,                  // to: their persona
-        &our_did,                   // body.did: our R-DID (or persona if no R-DID)
+        config.persona_did(), // from: our persona
+        &from_did,            // to: their persona
+        &our_did,             // body.did: our R-DID (or persona if no R-DID)
         &task_id,
     )?;
-    super::didcomm::send_message(service, config, &msg, &config.public.persona_did, &from_did)
+    super::didcomm::send_message(service, config, &msg, config.persona_did(), &from_did)
         .await
         .map_err(|e| anyhow::anyhow!("failed to send acceptance: {e}"))?;
 
@@ -197,8 +196,8 @@ pub async fn reject_relationship_request(
     };
 
     // Build and send rejection message
-    let msg = build_reject_message(&config.public.persona_did, &from_did, reason, &task_id)?;
-    super::didcomm::send_message(service, config, &msg, &config.public.persona_did, &from_did)
+    let msg = build_reject_message(config.persona_did(), &from_did, reason, &task_id)?;
+    super::didcomm::send_message(service, config, &msg, config.persona_did(), &from_did)
         .await
         .map_err(|e| anyhow::anyhow!("failed to send rejection: {e}"))?;
 
@@ -303,7 +302,7 @@ pub async fn accept_vrc_request(
     // Create VRC with current timestamp
     let valid_from = Utc::now();
     let mut vrc = DTGCredential::new_vrc(
-        config.public.persona_did.to_string(),
+        config.persona_did().to_string(),
         their_r_did.to_string(),
         valid_from,
         None, // no valid_until
@@ -558,6 +557,7 @@ async fn handle_accept_relationship(
     profile: &str,
     task_id: &str,
     generate_r_did: bool,
+    admin_vta: Option<&vta_sdk::client::VtaClient>,
 ) {
     if generate_r_did {
         state.main_page.content_panel.inbox.status_message =
@@ -572,7 +572,9 @@ async fn handle_accept_relationship(
     }
     let _ = state_tx.send(state.clone());
 
-    match accept_relationship_request(config, tdk, service, task_id, generate_r_did).await {
+    match accept_relationship_request(config, tdk, service, task_id, generate_r_did, admin_vta)
+        .await
+    {
         Ok(()) => save_and_sync(
             config,
             state,
@@ -694,6 +696,7 @@ pub(crate) async fn dispatch(
     state: &mut State,
     state_tx: &watch::Sender<State>,
     profile: &str,
+    admin_vta: Option<&vta_sdk::client::VtaClient>,
 ) {
     match action {
         InboxAction::SelectTask(index) => handle_inbox_select(state, index),
@@ -714,6 +717,7 @@ pub(crate) async fn dispatch(
                 profile,
                 &task_id,
                 generate_r_did,
+                admin_vta,
             )
             .await
         }

@@ -22,8 +22,9 @@ use ratatui::{
 };
 
 use super::{
-    credentials_panel::CredentialsPanel, inbox_panel::InboxPanel, panel::Panel,
-    relationships_panel::RelationshipsPanel, settings_panel::SettingsPanel, vta_panel::VtaPanel,
+    communities_panel::CommunitiesPanel, credentials_panel::CredentialsPanel,
+    inbox_panel::InboxPanel, panel::Panel, relationships_panel::RelationshipsPanel,
+    settings_panel::SettingsPanel, vta_panel::VtaPanel,
 };
 
 // ****************************************************************************
@@ -64,6 +65,7 @@ impl ContentPanelState {
         };
 
         let panel: Option<Box<dyn Panel>> = match menu.selected_menu {
+            MainMenu::Communities => Some(Box::new(CommunitiesPanel)),
             MainMenu::Inbox => Some(Box::new(InboxPanel)),
             MainMenu::Relationships => Some(Box::new(RelationshipsPanel)),
             MainMenu::Credentials => Some(Box::new(CredentialsPanel)),
@@ -256,6 +258,10 @@ fn render_status_help(
         MediatorStatus::Unknown => Line::from(vec![
             Span::styled("  Connection:   ", label_style),
             Span::styled("Not connected", Style::new().fg(COLOR_DARK_GRAY)),
+        ]),
+        MediatorStatus::NoActiveCommunity => Line::from(vec![
+            Span::styled("  Connection:   ", label_style),
+            Span::styled("No active community", Style::new().fg(COLOR_DARK_GRAY)),
         ]),
     };
     lines.push(conn_line);

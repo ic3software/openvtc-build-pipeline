@@ -9,12 +9,10 @@ use openvtc_core::config::{KeyInfo, PersonaDIDKeys, secured_config::KeySourceMat
 use vta_sdk::{
     client::{CreateDidWebvhRequest, CreateKeyRequest, VtaClient},
     keys::KeyType,
-    provision_client::Protocol,
+    protocols::did_management::create::WebvhPathMode,
     session::{TokenResult, challenge_response},
     webvh::WebvhServerRecord,
 };
-
-use crate::state_handler::setup_sequence::VtaSetupState;
 
 /// Authenticate with VTA using REST challenge-response. Only valid for the
 /// REST transport — DIDComm-only VTAs authenticate implicitly when the
@@ -28,55 +26,6 @@ pub async fn authenticate(
     challenge_response(vta_url, credential_did, private_key_multibase, vta_did)
         .await
         .map_err(|e| anyhow::anyhow!("VTA authentication failed: {e}"))
-}
-
-/// Build a [`VtaClient`] using whichever transport bootstrap selected.
-///
-/// REST path: requires `vta_url` + `access_token` already populated.
-/// DIDComm path: opens a fresh DIDComm session as the rotated admin DID
-/// against the advertised mediator. The session itself is the auth, so
-/// no separate token is needed.
-pub async fn build_vta_client(setup: &VtaSetupState) -> Result<VtaClient> {
-    match setup.protocol {
-        Some(Protocol::DidComm) => {
-            let mediator = setup
-                .mediator_did
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("DIDComm transport: mediator_did not captured"))?;
-            let admin = setup
-                .admin_credential
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("DIDComm transport: admin_credential missing"))?;
-            let rest_fallback = if setup.vta_url.is_empty() {
-                None
-            } else {
-                Some(setup.vta_url.clone())
-            };
-            VtaClient::connect_didcomm(
-                &admin.admin_did,
-                &admin.admin_private_key_mb,
-                &setup.vta_did,
-                mediator,
-                rest_fallback,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("DIDComm session open failed: {e}"))
-        }
-        // REST (or unset — falls through to REST for compatibility with
-        // any pre-protocol-tracked state).
-        _ => {
-            let token = setup
-                .access_token
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("REST transport: access_token missing"))?;
-            if setup.vta_url.is_empty() {
-                return Err(anyhow::anyhow!("REST transport: vta_url is empty"));
-            }
-            let client = VtaClient::new(&setup.vta_url);
-            client.set_token(token);
-            Ok(client)
-        }
-    }
 }
 
 /// Create persona keys via VTA service
@@ -255,9 +204,13 @@ pub async fn create_did_via_server(
     tdk: &TDK,
     context_id: &str,
     server_id: &str,
-    path: Option<String>,
+    path_mode: WebvhPathMode,
 ) -> Result<(PersonaDIDKeys, String, Document, String)> {
     let created = Utc::now();
+
+    // `path_mode` is the authoritative path selector (WellKnown / Explicit /
+    // AutoAssign). The legacy `path` field is left `None` — the server rejects a
+    // present-but-empty path with `e.p.did.path-invalid`.
 
     // Use the VTA's built-in mediator service rather than additional_services,
     // because the VTA formats the service ID as a full DID URL (e.g. "did:...#vta-didcomm")
@@ -266,7 +219,8 @@ pub async fn create_did_via_server(
         context_id: context_id.to_string(),
         server_id: Some(server_id.to_string()),
         url: None,
-        path,
+        path: None,
+        path_mode: Some(path_mode),
         // No explicit hosting-domain override: the server determines the
         // domain from the selected `server_id`.
         domain: None,
@@ -356,4 +310,48 @@ pub async fn create_did_via_server(
         .map_err(|e| anyhow::anyhow!("Failed to resolve created DID: {e}"))?;
 
     Ok((persona_keys, did, resolved.doc, mnemonic))
+}
+
+// ── State-B join seams (R-A-5 Stage 4) ──────────────────────────────────────
+//
+// Stubbed async seams: they carry the final signatures (so the real VTA/VTC
+// calls are a body swap with no call-site churn) but do not hit the network yet.
+
+/// Receipt from submitting a community join request.
+#[derive(Clone, Debug)]
+pub struct JoinReceipt {
+    /// Correlates the VTC's asynchronous accept/reject decision (R-B-8).
+    pub request_id: uuid::Uuid,
+}
+
+/// Create the per-community sub-context under the account's top context (D9).
+///
+/// The id is already derived client-side via
+/// [`context_path::build_sub_context_id`](openvtc_core::config::context_path::build_sub_context_id);
+/// this seam is where the VTA registration call will go. STUB: echoes the id
+/// back. `parent_id` is the account's `top_context_id`.
+#[allow(clippy::unused_async)]
+pub async fn create_sub_context(
+    client: &VtaClient,
+    parent_id: &str,
+    sub_context_id: &str,
+) -> Result<String> {
+    let _ = (client, parent_id);
+    Ok(sub_context_id.to_string())
+}
+
+/// Submit a join request to a community (VTC), presenting the chosen persona.
+///
+/// STUB: synthesizes a local `request_id`. The real VTA/VTC submission (with the
+/// holder's verifiable presentation) is a later body swap.
+#[allow(clippy::unused_async)]
+pub async fn submit_join(
+    client: &VtaClient,
+    vtc_did: &str,
+    sub_context_id: &str,
+) -> Result<JoinReceipt> {
+    let _ = (client, vtc_did, sub_context_id);
+    Ok(JoinReceipt {
+        request_id: uuid::Uuid::new_v4(),
+    })
 }

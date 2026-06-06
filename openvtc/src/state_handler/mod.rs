@@ -53,6 +53,8 @@ pub mod actions;
 mod credential_actions;
 pub mod didcomm;
 mod inbox_actions;
+pub mod join;
+mod join_flow;
 pub mod main_page;
 mod message_dispatch;
 mod relationship_actions;
@@ -118,14 +120,17 @@ impl StateHandler {
         let mut state = State::default();
 
         let starting_mode = std::mem::replace(&mut self.starting_mode, StartingMode::NotSet);
-        let (tdk, mut config) = match starting_mode {
+        // The third element is the live admin VTA session handed back by
+        // `load_step2` (PERF #1) for reuse below; `None` for the modes that
+        // don't open one (they fall back to building one as before).
+        let (tdk, mut config, loaded_admin_vta) = match starting_mode {
             StartingMode::MainPage(config, tdk) => {
                 state.active_page = ActivePage::Main;
                 state.main_page.menu_panel.selected = true;
                 state.main_page.config = (&config).into();
                 state.main_page.log("Configuration loaded");
 
-                (tdk.to_owned(), config)
+                (tdk.to_owned(), config, None)
             }
             StartingMode::SetupWizard => {
                 // Instantiate TDK
@@ -142,12 +147,11 @@ impl StateHandler {
                     Ok(SetupWizardExit::Config(mut config)) => {
                         crate::apply_env_overrides(&mut config);
 
-                        // Push the main menu skeleton *before* the slow
-                        // post-setup work (keyring read, VTA round-trip,
-                        // mediator handshake) so the operator isn't stuck
-                        // on FinalPage for several seconds. The remaining
-                        // tasks update connection status as they progress.
-                        state.active_page = ActivePage::Main;
+                        // Show the loading screen during the slow post-setup work
+                        // (keyring read, VTA round-trip, mediator handshake)
+                        // instead of a not-yet-interactive main page; it switches
+                        // to Main once the connection is ready.
+                        state.active_page = ActivePage::Loading;
                         state.main_page.menu_panel.selected = true;
                         state.main_page.sync_from_config(&config);
                         state.connection.status =
@@ -157,14 +161,18 @@ impl StateHandler {
                         // The setup wizard saved the config but the TDK secrets
                         // resolver is empty. Load persona key secrets so the
                         // DIDComm service can authenticate with the mediator.
-                        if let Err(e) = config.load_persona_secrets(&tdk).await {
+                        // R-A-5: a State-A account has no persona, so there are no
+                        // secrets to load — skip it (and the VTA round-trip).
+                        if config.active_identity().is_some()
+                            && let Err(e) = config.load_persona_secrets(&tdk).await
+                        {
                             state
                                 .main_page
                                 .log_error("Warning: failed to load persona keys", &e);
                         }
                         state.main_page.log("Setup complete — configuration loaded");
 
-                        (tdk, config)
+                        (tdk, config, None)
                     }
                     Ok(SetupWizardExit::Interrupted(interrupted)) => {
                         if let Err(e) = terminator.terminate(interrupted.clone()) {
@@ -182,18 +190,24 @@ impl StateHandler {
                 }
             }
             StartingMode::MainPageDeferred(deferred) => {
-                // Set minimal state from PublicConfig so UI can render immediately
-                state.active_page = ActivePage::Main;
+                // Show the loading screen while the config decrypts and the
+                // mediator connection is established; it switches to Main once
+                // ready (or stays up to show a startup error).
+                state.active_page = ActivePage::Loading;
                 state.main_page.menu_panel.selected = true;
                 state.main_page.config = main_page::MainMenuConfigState {
                     name: deferred.public_config.friendly_name.clone(),
-                    did: deferred.public_config.persona_did.clone(),
+                    // The persona DID now lives in the encrypted account, which
+                    // isn't decrypted yet at this pre-load render. It populates
+                    // from the full Config once load_step2 completes.
+                    did: std::sync::Arc::new(String::new()),
                 };
                 state.connection.status = state::MediatorStatus::Initializing("Starting...".into());
                 let _ = self.state_tx.send(state.clone());
 
-                // Spawn TDK init + config load as a background task with progress reporting
-                let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<String>();
+                // Spawn TDK init + config load as a background task with
+                // hierarchical progress reporting: each event is (major, sub).
+                let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<(String, String)>();
 
                 // Dedicated channel for token-touch events.  The notifier sends a bool
                 // (true = touch required, false = touch completed) and the StateHandler's
@@ -207,13 +221,13 @@ impl StateHandler {
                 let (token_touch_tx, mut token_touch_rx) = mpsc::unbounded_channel::<bool>();
 
                 let mut load_handle = tokio::spawn(async move {
-                    let on_progress = |msg: &str| {
-                        if let Err(e) = progress_tx.send(msg.to_string()) {
+                    let on_progress = |major: &str, sub: &str| {
+                        if let Err(e) = progress_tx.send((major.to_string(), sub.to_string())) {
                             debug!("Failed to send progress event: {e}");
                         }
                     };
 
-                    on_progress("Starting TDK...");
+                    on_progress("Local configuration", "Starting TDK");
                     let mut tdk = TDK::new(
                         TDKConfig::builder()
                             .with_load_environment(false)
@@ -252,7 +266,9 @@ impl StateHandler {
                     #[cfg(not(feature = "openpgp-card"))]
                     drop(token_touch_tx);
 
-                    let config = Config::load_step2(
+                    // PERF #1: load_step2 returns its live admin VTA session for
+                    // reuse downstream instead of opening a second one here.
+                    let (config, admin_session) = Config::load_step2(
                         &mut tdk,
                         &deferred.profile,
                         deferred.public_config,
@@ -266,15 +282,23 @@ impl StateHandler {
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-                    Ok::<_, anyhow::Error>((tdk, config))
+                    Ok::<_, anyhow::Error>((tdk, config, admin_session))
                 });
 
-                // Listen for progress updates + handle user actions while loading
-                let (tdk, config) = loop {
+                // Listen for progress updates + handle user actions while
+                // loading. `progress` drives the hierarchical loading model,
+                // stamping each sub-step/major with its duration as the next
+                // begins (and the whole thing when the load finishes).
+                let mut progress = state::LoadingProgress::default();
+                let (tdk, config, loaded_admin_vta) = loop {
                     tokio::select! {
-                        Some(msg) = progress_rx.recv() => {
+                        Some((major, sub)) = progress_rx.recv() => {
+                            progress.begin(&mut state.loading, &major, &sub);
+                            state.tip_index = state.tip_index.wrapping_add(1);
                             state.connection.status =
-                                state::MediatorStatus::Initializing(msg);
+                                state::MediatorStatus::Initializing(
+                                    format!("{major} — {sub}"),
+                                );
                             let _ = self.state_tx.send(state.clone());
                         }
                         // Token-touch notifications arrive through the dedicated channel
@@ -285,21 +309,29 @@ impl StateHandler {
                         }
                         result = &mut load_handle => {
                             match result {
-                                Ok(Ok((tdk, config))) => break (tdk, config),
+                                Ok(Ok((tdk, config, admin_session))) => {
+                                    // Stamp the final step + major as Done.
+                                    progress.finish(&mut state.loading);
+                                    break (tdk, config, admin_session);
+                                }
                                 Ok(Err(e)) => {
+                                    progress.fail(&mut state.loading);
                                     state.connection.status =
                                         state::MediatorStatus::Failed(format!("{e}"));
                                     let _ = self.state_tx.send(state.clone());
+                                    // No config loaded here — join is unavailable.
                                     return self
                                         .run_degraded_loop(
                                             &mut action_rx,
                                             &mut interrupt_rx,
                                             &mut terminator,
                                             &mut state,
+                                            None,
                                         )
                                         .await;
                                 }
                                 Err(join_err) => {
+                                    progress.fail(&mut state.loading);
                                     state.connection.status =
                                         state::MediatorStatus::Failed(
                                             format!("Internal error: {join_err}"),
@@ -311,6 +343,7 @@ impl StateHandler {
                                             &mut interrupt_rx,
                                             &mut terminator,
                                             &mut state,
+                                            None,
                                         )
                                         .await;
                                 }
@@ -340,7 +373,7 @@ impl StateHandler {
                 state.main_page.sync_from_config(&config);
                 state.main_page.log("Configuration loaded");
 
-                (tdk, config)
+                (tdk, config, loaded_admin_vta)
             }
             StartingMode::NotSet => {
                 let err = Interrupted::SystemError("Starting Mode is Not Set!".to_string());
@@ -354,25 +387,79 @@ impl StateHandler {
         // Set the profile name once (doesn't change during runtime)
         state.main_page.content_panel.vta.profile = self.profile.clone();
 
-        // Fetch VTA context name if using VTA backend. The helper handles
-        // both DIDComm and REST transports automatically.
-        if matches!(
+        // The always-on admin VTA session for VTA backends. It stays open for
+        // the whole time openvtc runs and is reused by every runtime VTA op
+        // (context-name fetch, relationship creation, and future community joins
+        // / context creation), so the admin DID holds ONE mediator connection
+        // instead of reconnecting per operation. It is shut down at every exit
+        // path below (degraded returns + end of the main loop).
+        //
+        // PERF #1: prefer the session `load_step2` already opened (handed back
+        // as `loaded_admin_vta`) so the whole runtime uses a SINGLE admin
+        // connection. Only fall back to opening one here when there isn't one
+        // (the SetupWizard / pre-loaded-Config modes, or a State-A account that
+        // had no persona to open a session for).
+        let admin_vta: Option<vta_sdk::client::VtaClient> = if loaded_admin_vta.is_some() {
+            loaded_admin_vta
+        } else if matches!(
             &config.key_backend,
             openvtc_core::config::KeyBackend::Vta { .. }
-        ) && let Ok(client) =
-            openvtc_core::config::build_runtime_vta_client(&config.key_backend).await
+        ) {
+            openvtc_core::config::build_runtime_vta_client(&config.key_backend)
+                .await
+                .ok()
+        } else {
+            None
+        };
+
+        // Fetch VTA context name, reusing the always-on admin session.
+        if let Some(client) = admin_vta.as_ref()
             && let Ok(resp) = client.list_contexts().await
         {
             if let Some(ctx) = resp
                 .contexts
                 .iter()
-                .find(|c| c.did.as_deref() == Some(config.public.persona_did.as_str()))
+                .find(|c| c.did.as_deref() == Some(config.persona_did()))
             {
                 state.main_page.content_panel.vta.context_name = Some(ctx.name.clone());
             } else if let Some(ctx) = resp.contexts.first() {
                 // Fallback to first context
                 state.main_page.content_panel.vta.context_name = Some(ctx.name.clone());
             }
+        }
+
+        // Phase 1 (config load + VTA) is complete. Stay on the loading screen
+        // and offer "Press Enter to continue" — but kick off phase 2 (the
+        // per-community DIDComm connection) right away below, so the work is
+        // already happening in the background regardless of when the user hits
+        // Enter. Dismissing the loading screen (Enter) reveals the main page.
+        state.loading_complete = true;
+
+        // A State-A account has no persona/community yet (R-A-5): there is no
+        // DID to open a DIDComm session for. Skip the persona listener entirely
+        // and run the responsive degraded loop so the user can still navigate,
+        // open the Communities page, and start a join.
+        if config.active_identity().is_none() {
+            state.connection.status = state::MediatorStatus::NoActiveCommunity;
+            let _ = self.state_tx.send(state.clone());
+            // No persona yet (State A). Hand the always-on admin session to the
+            // degraded loop so the Communities `j` → join flow (R-A-5 Stage 4)
+            // can reuse it; the loop closes it on exit.
+            let join_ctx = DegradedJoinContext {
+                tdk,
+                config,
+                admin_vta,
+                profile: self.profile.clone(),
+            };
+            return self
+                .run_degraded_loop(
+                    &mut action_rx,
+                    &mut interrupt_rx,
+                    &mut terminator,
+                    &mut state,
+                    Some(join_ctx),
+                )
+                .await;
         }
 
         // Send initial state immediately so the UI renders without blocking
@@ -403,12 +490,22 @@ impl StateHandler {
                     .main_page
                     .log_error("DIDComm service failed to start", &e);
                 let _ = self.state_tx.send(state.clone());
+                // Messaging is down but the admin VTA session may still be live;
+                // hand it to the degraded loop so the user can still join a
+                // community (State-B path). The loop closes the session on exit.
+                let join_ctx = DegradedJoinContext {
+                    tdk,
+                    config,
+                    admin_vta,
+                    profile: self.profile.clone(),
+                };
                 return self
                     .run_degraded_loop(
                         &mut action_rx,
                         &mut interrupt_rx,
                         &mut terminator,
                         &mut state,
+                        Some(join_ctx),
                     )
                     .await;
             }
@@ -429,25 +526,18 @@ impl StateHandler {
         }
         info!(count = listeners.len(), "DIDComm listeners registered");
 
-        // Wait for persona listener to connect.
-        // Latency starts at 0 and updates from the first keepalive ping round-trip.
-        match didcomm_service
-            .wait_connected(
-                didcomm::PERSONA_LISTENER_ID,
-                std::time::Duration::from_secs(30),
-            )
-            .await
-        {
-            Ok(()) => {
-                state.connection.status = state::MediatorStatus::Connected;
-                state.connection.messaging_active = true;
-                state.main_page.log("Connected to mediator");
-            }
-            Err(e) => {
-                state.connection.status = state::MediatorStatus::Failed(format!("{e:#}"));
-                state.main_page.log_error("Mediator connection failed", &e);
-            }
-        }
+        // Phase 2 (community/persona DIDComm connection) runs ASYNCHRONOUSLY: we
+        // do NOT block the UI waiting for the listener. The main page is already
+        // showing (Connecting); the persona connection proceeds in the
+        // background and the runtime loop below flips the status to Connected the
+        // moment a `ListenerEvent::Connected` arrives — and back to Connecting on
+        // a disconnect. Subscribe to typed lifecycle events for that.
+        let mut listener_events = didcomm_service.subscribe();
+        // The persona listener's id (community-scoped, derived from its DID) is
+        // stable for the life of this loop — compute it once for event matching.
+        let persona_lid = didcomm::persona_listener_id(config.persona_did());
+        state.connection.status = state::MediatorStatus::Connecting;
+        state.main_page.log("Connecting to the mediator…");
         let _ = self.state_tx.send(state.clone());
 
         // Track when a manual trust-ping was sent (for activity log latency display).
@@ -471,6 +561,11 @@ impl StateHandler {
 
                         break interrupted;
                     },
+                    Action::DismissLoading => {
+                        // Phase 1 done + user pressed Enter — reveal the main page
+                        // (phase-2 connection is already running in the background).
+                        state.active_page = state::ActivePage::Main;
+                    },
                     Action::MainMenuSelected(menu_item) => {
                         // User has changed main menu selection
                         state.main_page.menu_panel.selected_menu = menu_item;
@@ -489,6 +584,74 @@ impl StateHandler {
                             }
                         }
                     },
+                    Action::CommunitySelect(i) => {
+                        state.main_page.content_panel.communities.selected_index = i;
+                    },
+                    Action::CommunityConfirmDelete(i) => {
+                        state.main_page.content_panel.communities.confirm_delete = Some(i);
+                    },
+                    Action::CommunityCancelDelete => {
+                        state.main_page.content_panel.communities.confirm_delete = None;
+                    },
+                    Action::DeleteCommunity(i) => {
+                        // Capture the listener id before the delete, while the
+                        // persona/community are still present.
+                        let listener_id = didcomm::persona_listener_id(config.persona_did());
+                        self.remove_community(&mut state, &mut config, i);
+                        // A deleted community must not leave its persona's
+                        // mediator connection running. If the active persona no
+                        // longer has any live community, stop and remove its
+                        // listener so the connection is torn down with the
+                        // community (not left dangling).
+                        let persona_id = config.active_identity().map(|id| id.persona_id);
+                        let still_live = persona_id.is_some_and(|pid| {
+                            config
+                                .account
+                                .communities
+                                .values()
+                                .any(|c| c.persona_ref == pid && c.is_live())
+                        });
+                        if !still_live {
+                            if let Err(e) = didcomm_service.remove_listener(&listener_id).await {
+                                debug!("remove_listener after community delete: {e}");
+                            }
+                            state.connection.status = state::MediatorStatus::NoActiveCommunity;
+                            state.connection.messaging_active = false;
+                            state
+                                .main_page
+                                .log("Community removed — persona listener stopped.");
+                        }
+                    },
+                    Action::StartJoin => {
+                        // State-B join from the live runtime: reuse the always-on
+                        // admin VTA session. The DIDComm service keeps running in
+                        // the background; the join flow owns the screen until the
+                        // user returns. Restart is required to activate the new
+                        // community (hot-start is a deliberate follow-up).
+                        match self
+                            .join_flow(
+                                &mut action_rx,
+                                &mut interrupt_rx,
+                                &mut state,
+                                &tdk,
+                                &mut config,
+                                admin_vta.as_ref(),
+                                self.profile.as_str(),
+                            )
+                            .await
+                        {
+                            Ok(join_flow::JoinExit::Returned) => {
+                                state.active_page = state::ActivePage::Main;
+                            }
+                            Ok(join_flow::JoinExit::Exit(interrupted)) => {
+                                break interrupted;
+                            }
+                            Err(e) => {
+                                state.main_page.log_error("Join flow failed", &e);
+                                state.active_page = state::ActivePage::Main;
+                            }
+                        }
+                    },
                     Action::Inbox(ia) => {
                         inbox_actions::dispatch(
                             ia,
@@ -498,6 +661,7 @@ impl StateHandler {
                             &mut state,
                             &self.state_tx,
                             &self.profile,
+                            admin_vta.as_ref(),
                         )
                         .await;
                     },
@@ -511,6 +675,7 @@ impl StateHandler {
                             &self.state_tx,
                             &self.profile,
                             &mut ping_sent_at,
+                            admin_vta.as_ref(),
                         )
                         .await;
                     },
@@ -611,7 +776,7 @@ impl StateHandler {
                             let sender_arc = std::sync::Arc::new(sender.to_string());
 
                             // Only respond to pings from the mediator or established relationships
-                            let is_mediator = sender == config.public.mediator_did;
+                            let is_mediator = sender == config.mediator_did();
                             let has_relationship = config
                                 .private
                                 .relationships
@@ -629,7 +794,7 @@ impl StateHandler {
                                 let our_listener_did = didcomm_service
                                     .listener_did(&listener_id)
                                     .await
-                                    .unwrap_or_else(|| config.public.persona_did.to_string());
+                                    .unwrap_or_else(|| config.persona_did().to_string());
                                 if let Some(ref from_did) = from
                                     && let Ok(pong_msg) =
                                         build_trust_pong(&our_listener_did, from_did, &message_id)
@@ -713,6 +878,30 @@ impl StateHandler {
                 Some(log_msg) = lifecycle_log_rx.recv() => {
                     state.main_page.log(log_msg);
                 },
+                // Typed listener lifecycle events → drive the connection status
+                // asynchronously (phase 2). The persona listener connecting flips
+                // the status to Connected; a disconnect drops back to Connecting
+                // while the service auto-reconnects.
+                ev = listener_events.recv() => {
+                    use affinidi_messaging_didcomm_service::ListenerEvent;
+                    if let Ok(ev) = ev {
+                        match ev {
+                            ListenerEvent::Connected { listener_id }
+                                if listener_id == persona_lid =>
+                            {
+                                state.connection.status = state::MediatorStatus::Connected;
+                                state.connection.messaging_active = true;
+                            }
+                            ListenerEvent::Disconnected { listener_id, .. }
+                                if listener_id == persona_lid =>
+                            {
+                                state.connection.status = state::MediatorStatus::Connecting;
+                                state.connection.messaging_active = false;
+                            }
+                            _ => {}
+                        }
+                    }
+                },
                 // (keepalive removed — WebSocket-level pings handle connectivity)
                 // Catch and handle interrupt signal to gracefully shutdown
                 Ok(interrupted) = interrupt_rx.recv() => {
@@ -726,31 +915,89 @@ impl StateHandler {
         shutdown_token.cancel();
         didcomm_service.shutdown().await;
 
+        // Close the always-on admin VTA session.
+        if let Some(c) = admin_vta {
+            c.shutdown().await;
+        }
+
         Ok(result)
     }
 
-    /// Minimal event loop for when init fails -- keeps UI alive so user sees the error and can exit.
+    /// Remove the community at `index` in the Communities display list: withdraw
+    /// a live (Pending/Active) membership first (R-C-8 — for a pending join this
+    /// is the withdrawal), then delete the record, persist, and refresh the
+    /// panel. Surfaces the outcome as a status message.
+    fn remove_community(&self, state: &mut State, config: &mut Config, index: usize) {
+        let Some(vtc) = config
+            .account
+            .communities_for_display(false)
+            .get(index)
+            .map(|c| c.vtc_did.clone())
+        else {
+            return;
+        };
+        // The confirmation is now resolved.
+        state.main_page.content_panel.communities.confirm_delete = None;
+        if config.account.community(&vtc).is_some_and(|c| c.is_live())
+            && let Some(c) = config.account.community_mut(&vtc)
+        {
+            c.leave();
+        }
+        match config.account.delete_community(&vtc) {
+            Ok(_) => {
+                if let Err(e) = config.save(
+                    &self.profile,
+                    #[cfg(feature = "openpgp-card")]
+                    &|| eprintln!("Touch confirmation needed for decryption"),
+                ) {
+                    state
+                        .main_page
+                        .log_error("Failed to save after removing community", &e);
+                }
+                state.main_page.sync_from_config(config);
+                state.main_page.content_panel.communities.status_message =
+                    Some("Community removed.".to_string());
+            }
+            Err(e) => {
+                state.main_page.content_panel.communities.status_message =
+                    Some(format!("Could not remove community: {e}"));
+            }
+        }
+    }
+
+    /// Minimal event loop for when there is no active community / messaging
+    /// (State-A) or after an init failure — keeps the UI alive so the user can
+    /// navigate, exit, and (when `join_ctx` is supplied) start a join.
+    ///
+    /// `join_ctx` carries the runtime pieces the join flow needs (TDK, the live
+    /// `Config`, the always-on admin VTA session, profile). The early
+    /// load-failure callers have no loaded config, so they pass `None` and
+    /// `StartJoin` is a no-op there.
     async fn run_degraded_loop(
         &self,
         action_rx: &mut UnboundedReceiver<Action>,
         interrupt_rx: &mut broadcast::Receiver<Interrupted>,
         terminator: &mut Terminator,
         state: &mut State,
+        mut join_ctx: Option<DegradedJoinContext>,
     ) -> Result<Interrupted> {
-        loop {
+        let result = loop {
             tokio::select! {
                 Some(action) = action_rx.recv() => match action {
                     Action::Exit => {
                         if let Err(e) = terminator.terminate(Interrupted::UserInt) {
                             debug!("Failed to send terminate signal: {e}");
                         }
-                        return Ok(Interrupted::UserInt);
+                        break Interrupted::UserInt;
                     }
                     Action::UXError(interrupted) => {
                         if let Err(e) = terminator.terminate(interrupted.clone()) {
                             debug!("Failed to send terminate signal: {e}");
                         }
-                        return Ok(interrupted);
+                        break interrupted;
+                    }
+                    Action::DismissLoading => {
+                        state.active_page = state::ActivePage::Main;
                     }
                     Action::MainMenuSelected(menu_item) => {
                         state.main_page.menu_panel.selected_menu = menu_item;
@@ -767,15 +1014,87 @@ impl StateHandler {
                             }
                         }
                     }
+                    Action::CommunitySelect(i) => {
+                        state.main_page.content_panel.communities.selected_index = i;
+                    }
+                    Action::CommunityConfirmDelete(i) => {
+                        state.main_page.content_panel.communities.confirm_delete = Some(i);
+                    }
+                    Action::CommunityCancelDelete => {
+                        state.main_page.content_panel.communities.confirm_delete = None;
+                    }
+                    Action::DeleteCommunity(i) => {
+                        if let Some(ctx) = join_ctx.as_mut() {
+                            self.remove_community(state, &mut ctx.config, i);
+                        }
+                    }
+                    Action::StartJoin => {
+                        if let Some(ctx) = join_ctx.as_mut() {
+                            match self
+                                .join_flow(
+                                    action_rx,
+                                    interrupt_rx,
+                                    state,
+                                    &ctx.tdk,
+                                    &mut ctx.config,
+                                    ctx.admin_vta.as_ref(),
+                                    ctx.profile.as_str(),
+                                )
+                                .await
+                            {
+                                Ok(join_flow::JoinExit::Returned) => {
+                                    // Back on the main page; resume the degraded loop.
+                                    state.active_page = state::ActivePage::Main;
+                                }
+                                Ok(join_flow::JoinExit::Exit(interrupted)) => {
+                                    if let Err(e) = terminator.terminate(interrupted.clone()) {
+                                        debug!("Failed to send terminate signal: {e}");
+                                    }
+                                    break interrupted;
+                                }
+                                Err(e) => {
+                                    state
+                                        .main_page
+                                        .log_error("Join flow failed", &e);
+                                    state.active_page = state::ActivePage::Main;
+                                }
+                            }
+                        } else {
+                            state
+                                .main_page
+                                .log("Cannot join: no active VTA session.");
+                        }
+                    }
                     _ => {}
                 },
                 Ok(interrupted) = interrupt_rx.recv() => {
-                    return Ok(interrupted);
+                    break interrupted;
                 }
             }
             let _ = self.state_tx.send(state.clone());
+        };
+
+        // Close the always-on admin VTA session owned by the join context, if any.
+        if let Some(ctx) = join_ctx
+            && let Some(c) = ctx.admin_vta
+        {
+            c.shutdown().await;
         }
+
+        Ok(result)
     }
+}
+
+/// Runtime context the degraded loop hands to [`StateHandler::join_flow`].
+///
+/// Owns the live `Config` (mutated + persisted by a successful join), the TDK,
+/// the always-on admin VTA session, and the profile name. The admin session is
+/// shut down when the degraded loop returns.
+struct DegradedJoinContext {
+    tdk: TDK,
+    config: Box<Config>,
+    admin_vta: Option<vta_sdk::client::VtaClient>,
+    profile: String,
 }
 
 // Per-domain action dispatch lives in the corresponding sub-module:

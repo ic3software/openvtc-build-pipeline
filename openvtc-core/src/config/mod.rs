@@ -16,18 +16,17 @@ use crate::{
     },
     errors::OpenVTCError,
 };
-use affinidi_tdk::{
-    did_common::Document, messaging::profiles::ATMProfile, secrets_resolver::secrets::Secret,
-};
+use affinidi_tdk::secrets_resolver::secrets::Secret;
 use argon2::{Algorithm, Argon2, Params, Version};
 use chrono::{DateTime, TimeDelta, Utc};
-use dtg_credentials::DTGCredential;
 use ed25519_dalek_bip32::ExtendedSigningKey;
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, fmt::Display, sync::Arc};
+use std::{collections::HashMap, fmt::Display};
 
+pub mod account;
+pub mod context_path;
 pub mod did;
 pub mod keys;
 pub mod loading;
@@ -240,9 +239,6 @@ pub struct Config {
     /// Where did the key values come from? Derived or Imported?
     pub key_info: HashMap<String, KeyInfoConfig>,
 
-    /// Persona DID and Document
-    pub persona_did: PersonaDID,
-
     // *********************************************
     // Temporary Config values
     /// What protection method is being used for the secured config.
@@ -263,14 +259,22 @@ pub struct Config {
     /// user provides an unlock passphrase; `None` for plaintext or token flows.
     pub unlock_code: Option<SecretBox<Vec<u8>>>,
 
-    /// Holds ATM profiles for relationships
-    /// Key: Our local DID for the relationship
-    /// NOTE: Does not hold the persona DID profile!
-    pub atm_profiles: HashMap<Arc<String>, Arc<ATMProfile>>,
+    /// Config v2 multi-community account model (personas + communities).
+    ///
+    /// The persisted source of truth for the account's personas and community
+    /// memberships (stored encrypted in [`ProtectedConfig`]). The persona DID,
+    /// mediator DID, and org DID that used to live as `public.*` singletons are
+    /// now read from here via [`Config::persona_did`], [`Config::mediator_did`],
+    /// and `account.org_did`.
+    pub account: account::Account,
 
-    /// All VRC's issued and received by VRC ID
-    /// Key: VRC ID
-    pub vrcs: HashMap<Arc<String>, Arc<DTGCredential>>,
+    /// Runtime-resolved identities (resolved DID document + ATM profile),
+    /// keyed by persona id. Not persisted — rebuilt at load from `account`.
+    ///
+    /// For the single-persona case this holds one entry, surfaced by
+    /// [`Config::active_identity`]. Multi-persona population + selection land in
+    /// a later slice.
+    pub identities: HashMap<account::PersonaId, crate::identity::IdentityContext>,
 }
 
 /// Serializable bundle of public and secured config, used for import/export.
@@ -280,16 +284,6 @@ pub struct ExportedConfig {
     pub pc: public_config::PublicConfig,
     /// The secured (secret key material) portion of the configuration.
     pub sc: secured_config::SecuredConfig,
-}
-
-/// Our public Persona DID used to identify ourselves within the Linux Foundation ecosystem
-#[derive(Clone, Debug)]
-pub struct PersonaDID {
-    /// Resolved DID Document for this DID
-    pub document: Document,
-
-    /// Messaging Profile representing this DID within the TDK
-    pub profile: Arc<ATMProfile>,
 }
 
 impl Config {
@@ -305,6 +299,77 @@ impl Config {
             } => Ok(SecretBox::new(Box::new(
                 encryption_seed.expose_secret().to_vec(),
             ))),
+        }
+    }
+
+    /// The currently-active runtime identity.
+    ///
+    /// T1 migration: for the single-persona case this returns the one resolved
+    /// identity. A proper "selected working community" selection replaces the
+    /// `.next()` heuristic when multi-community lands.
+    pub fn active_identity(&self) -> Option<&crate::identity::IdentityContext> {
+        self.identities.values().next()
+    }
+
+    /// The active persona's `did:webvh` as a string slice.
+    ///
+    /// Replaces the removed `public.persona_did` singleton. Returns `""` when no
+    /// identity is resolved — which should not occur after a successful load or
+    /// setup, where exactly one persona is always active.
+    pub fn persona_did(&self) -> &str {
+        self.active_identity().map(|i| i.did.as_str()).unwrap_or("")
+    }
+
+    /// The active persona's `did:webvh` as an owned `Arc<String>`.
+    ///
+    /// For the call sites that previously cloned the `Arc<String>` singleton
+    /// (e.g. to stash the DID on a message or relationship). The returned `Arc`
+    /// is freshly allocated; equality is by value, so sharing is not required.
+    pub fn persona_did_arc(&self) -> std::sync::Arc<String> {
+        std::sync::Arc::new(self.persona_did().to_string())
+    }
+
+    /// The active persona's mediator DID as a string slice (`""` if unset).
+    ///
+    /// Replaces the removed `public.mediator_did` singleton.
+    pub fn mediator_did(&self) -> &str {
+        self.active_identity()
+            .and_then(|i| i.mediator_did.as_deref())
+            .unwrap_or("")
+    }
+
+    /// Human label for the active persona's messaging profile: the community it
+    /// belongs to (its display name, else the VTC DID slug), so each community's
+    /// profile is identifiable rather than a generic "Persona". Falls back to
+    /// "Persona" when the persona has no community yet.
+    pub fn persona_profile_label(&self) -> String {
+        let Some(pid) = self.active_identity().map(|i| i.persona_id) else {
+            return "Persona".to_string();
+        };
+        self.account
+            .communities
+            .values()
+            .find(|c| c.persona_ref == pid)
+            .map(|c| {
+                c.display_name.clone().unwrap_or_else(|| {
+                    crate::config::context_path::render_for_display(&c.vtc_did).to_string()
+                })
+            })
+            .unwrap_or_else(|| "Persona".to_string())
+    }
+
+    /// Set the active persona's mediator DID, updating both the persisted
+    /// `account` record and the runtime `IdentityContext` so subsequent reads
+    /// (and the next save) see the new value. No-op if no identity is active.
+    pub fn set_active_mediator_did(&mut self, did: &str) {
+        let Some(id) = self.active_identity().map(|i| i.persona_id) else {
+            return;
+        };
+        if let Some(persona) = self.account.personas.get_mut(&id) {
+            persona.mediator_did = Some(did.to_string());
+        }
+        if let Some(ctx) = self.identities.get_mut(&id) {
+            ctx.mediator_did = Some(did.to_string());
         }
     }
 }
@@ -375,6 +440,30 @@ pub async fn build_runtime_vta_client(
         client.set_token(token.access_token);
         Ok(client)
     }
+}
+
+/// Run `f` with a runtime VTA client built from `backend`, guaranteeing the
+/// (DIDComm) session is shut down whether `f` returns `Ok` **or** `Err`.
+///
+/// Mirrors [`vta_sdk::client::VtaClient::with_didcomm`] but threads the caller's
+/// own error type — any `E: From<OpenVTCError>` (e.g. [`OpenVTCError`] or
+/// `anyhow::Error`). `shutdown` is a no-op for the REST transport. Prefer this
+/// over [`build_runtime_vta_client`] + a manual `shutdown()`: an early `?` in the
+/// body can otherwise drop the session without closing it, leaking a live
+/// session (and tripping the SDK's `LeakGuard`).
+pub async fn with_runtime_vta_client<F, Fut, T, E>(backend: &KeyBackend, f: F) -> Result<T, E>
+where
+    F: FnOnce(vta_sdk::client::VtaClient) -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: From<OpenVTCError>,
+{
+    // Hand the body an owned clone (a `VtaClient` shares its session across
+    // clones, and `shutdown` is idempotent) — passing by value sidesteps the
+    // async-closure-borrowed-argument lifetime limitation.
+    let client = build_runtime_vta_client(backend).await?;
+    let result = f(client.clone()).await;
+    client.shutdown().await;
+    result
 }
 
 // ****************************************************************************
@@ -532,5 +621,33 @@ mod tests {
         assert!(validate_passphrase("12345678").is_ok());
         assert!(validate_passphrase("1234567").is_err());
         assert!(validate_passphrase("").is_err());
+    }
+
+    /// A State-A (account-bootstrap, R-A-5) config carries an account but no
+    /// persona, so it resolves no runtime identity. The accessors must degrade
+    /// to the documented "no active community" sentinels rather than panic.
+    #[test]
+    fn zero_persona_config_has_no_active_identity() {
+        let config = Config {
+            public: public_config::PublicConfig::default(),
+            private: ProtectedConfig::default(),
+            key_backend: KeyBackend::Bip32 {
+                root: ExtendedSigningKey::from_seed(&[7u8; 32]).unwrap(),
+                seed: SecretString::new("seed".into()),
+            },
+            key_info: HashMap::new(),
+            protection_method: ProtectionMethod::default(),
+            #[cfg(feature = "openpgp-card")]
+            token_admin_pin: None,
+            #[cfg(feature = "openpgp-card")]
+            token_user_pin: SecretString::new("".into()),
+            unlock_code: None,
+            account: account::Account::default(),
+            identities: HashMap::new(),
+        };
+
+        assert!(config.active_identity().is_none());
+        assert_eq!(config.persona_did(), "");
+        assert_eq!(config.mediator_did(), "");
     }
 }

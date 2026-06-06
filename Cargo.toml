@@ -26,7 +26,7 @@ dtg-credentials = "0.1"
 aes-gcm = "0.10"
 argon2 = "0.5"
 affinidi-tdk = "0.7"
-affinidi-data-integrity = "0.6"
+affinidi-data-integrity = "0.7"
 affinidi-messaging-didcomm-service = "0.3"
 anyhow = "1.0"
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
@@ -79,7 +79,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tui-input = "0.15"
 url = "2.5"
-uuid = { version = "1.23", features = ["v4", "fast-rng"] }
+uuid = { version = "1.23", features = ["v4", "fast-rng", "serde"] }
 vta-sdk = { version = "0.9", features = [
   "session",
   "client",

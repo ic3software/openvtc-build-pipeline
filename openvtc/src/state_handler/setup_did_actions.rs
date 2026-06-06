@@ -5,6 +5,7 @@ use openvtc_core::{
 };
 use pgp::composed::ArmorOptions;
 use secrecy::SecretString;
+use vta_sdk::protocols::did_management::create::WebvhPathMode;
 
 use crate::{
     state_handler::{
@@ -90,11 +91,10 @@ pub(crate) async fn handle_webvh_server_create_did(
     state: &mut State,
     state_tx: &watch::Sender<State>,
     tdk: &TDK,
+    client: Option<&vta_sdk::client::VtaClient>,
     server_id: String,
-    custom_path: Option<String>,
+    path_mode: WebvhPathMode,
 ) -> anyhow::Result<bool> {
-    use crate::state_handler::setup_sequence::vta;
-
     state.setup.vta.use_webvh_server = true;
     state.setup.active_page = SetupPage::WebvhServerProgress;
     state.setup.webvh_server.messages.clear();
@@ -104,17 +104,15 @@ pub(crate) async fn handle_webvh_server_create_did(
     ));
     let _ = state_tx.send(state.clone());
 
-    let client = match vta::build_vta_client(&state.setup.vta).await {
-        Ok(c) => c,
-        Err(e) => {
-            state
-                .setup
-                .webvh_server
-                .messages
-                .push(MessageType::Error(format!("VTA client unavailable: {e}")));
-            state.setup.webvh_server.completed = Completion::CompletedFail;
-            return Ok(true);
-        }
+    // Reuse the wizard's single admin session (opened at provisioning) instead of
+    // opening a fresh VTA WebSocket here — per-op sockets churn the mediator's
+    // one-socket-per-DID policy and drop in-flight responses.
+    let Some(client) = client else {
+        state.setup.webvh_server.messages.push(MessageType::Error(
+            "VTA admin session unavailable — restart provisioning.".to_string(),
+        ));
+        state.setup.webvh_server.completed = Completion::CompletedFail;
+        return Ok(true);
     };
 
     let context_id = state.setup.vta.context_id.clone().unwrap_or_default();
@@ -126,7 +124,7 @@ pub(crate) async fn handle_webvh_server_create_did(
         .push(MessageType::Info(format!("Server: {}", server_id)));
     let _ = state_tx.send(state.clone());
 
-    apply_server_create_result(state, &client, tdk, &context_id, &server_id, custom_path).await;
+    apply_server_create_result(state, client, tdk, &context_id, &server_id, path_mode).await;
     Ok(false)
 }
 
@@ -136,9 +134,8 @@ pub(crate) async fn handle_custom_mediator_webvh(
     state: &mut State,
     state_tx: &watch::Sender<State>,
     tdk: &TDK,
+    client: Option<&vta_sdk::client::VtaClient>,
 ) -> anyhow::Result<bool> {
-    use crate::state_handler::setup_sequence::vta;
-
     state.setup.active_page = SetupPage::WebvhServerProgress;
     state.setup.webvh_server.messages.clear();
     state.setup.webvh_server.completed = Completion::NotFinished;
@@ -147,22 +144,18 @@ pub(crate) async fn handle_custom_mediator_webvh(
     ));
     let _ = state_tx.send(state.clone());
 
-    let client = match vta::build_vta_client(&state.setup.vta).await {
-        Ok(c) => c,
-        Err(e) => {
-            state
-                .setup
-                .webvh_server
-                .messages
-                .push(MessageType::Error(format!("VTA client unavailable: {e}")));
-            state.setup.webvh_server.completed = Completion::CompletedFail;
-            return Ok(true);
-        }
+    // Reuse the wizard's single admin session (see `handle_webvh_server_create_did`).
+    let Some(client) = client else {
+        state.setup.webvh_server.messages.push(MessageType::Error(
+            "VTA admin session unavailable — restart provisioning.".to_string(),
+        ));
+        state.setup.webvh_server.completed = Completion::CompletedFail;
+        return Ok(true);
     };
 
     let context_id = state.setup.vta.context_id.clone().unwrap_or_default();
     let server_id = state.setup.webvh_server.selected_server_id.clone();
-    let custom_path = state.setup.webvh_server.custom_path.clone();
+    let path_mode = state.setup.webvh_server.path_mode.clone();
 
     state
         .setup
@@ -171,7 +164,7 @@ pub(crate) async fn handle_custom_mediator_webvh(
         .push(MessageType::Info(format!("Server: {}", server_id)));
     let _ = state_tx.send(state.clone());
 
-    apply_server_create_result(state, &client, tdk, &context_id, &server_id, custom_path).await;
+    apply_server_create_result(state, client, tdk, &context_id, &server_id, path_mode).await;
     Ok(false)
 }
 
@@ -182,11 +175,11 @@ async fn apply_server_create_result(
     tdk: &TDK,
     context_id: &str,
     server_id: &str,
-    custom_path: Option<String>,
+    path_mode: WebvhPathMode,
 ) {
     use crate::state_handler::setup_sequence::vta;
 
-    match vta::create_did_via_server(client, tdk, context_id, server_id, custom_path).await {
+    match vta::create_did_via_server(client, tdk, context_id, server_id, path_mode).await {
         Ok((persona_keys, did, document, mnemonic)) => {
             state
                 .setup

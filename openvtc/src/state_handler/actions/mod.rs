@@ -207,6 +207,39 @@ pub enum Action {
     Contact(ContactAction),
     Settings(SettingsAction),
 
+    /// Dismiss the startup loading screen (Enter, once loading has completed) and
+    /// reveal the main page. Phase-2 connections are already running in the
+    /// background by this point.
+    DismissLoading,
+
+    // ************************************************************************
+    // JOIN flow (R-A-5 Stage 4 — State-B "join a community")
+    /// Open the join flow (pressing `j` on the Communities panel). Handled in
+    /// both the degraded loop (State-A first join) and the runtime select loop.
+    StartJoin,
+
+    /// Submit the entered community VTC DID — kicks off the automated
+    /// persona-mint + sub-context + join-submit sequence.
+    JoinSubmitVtc(String),
+
+    /// Cancel the join flow and return to the main page.
+    JoinCancel,
+
+    /// Move the Communities-list selection to this index.
+    CommunitySelect(usize),
+
+    /// Arm a removal confirmation for the community at this index (the panel
+    /// prompts for y/n before anything is deleted).
+    CommunityConfirmDelete(usize),
+
+    /// Dismiss a pending removal confirmation without deleting.
+    CommunityCancelDelete,
+
+    /// Remove the community at this index in the Communities list (withdraws a
+    /// live/pending membership, then deletes the record). Only sent after the
+    /// user confirms.
+    DeleteCommunity(usize),
+
     // ************************************************************************
     // SETUP Pages
     /// Import existing Config
@@ -271,8 +304,11 @@ pub enum Action {
     TokenWriteKeys(Option<Arc<Mutex<Card<Open>>>>),
 
     // ************************************************************************
-    /// Create a DID via a WebVH server (server_id, optional custom path)
-    WebvhServerCreateDid(String, Option<String>),
+    /// Create a DID via a WebVH server (server_id, path mode)
+    WebvhServerCreateDid(
+        String,
+        vta_sdk::protocols::did_management::create::WebvhPathMode,
+    ),
 
     /// Using a custom mediator DID
     SetCustomMediator(String),

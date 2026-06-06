@@ -268,14 +268,13 @@ impl MainPageState {
 
         // Sync settings
         self.content_panel.settings.friendly_name = config.public.friendly_name.clone();
-        self.content_panel.settings.mediator_did = config.public.mediator_did.clone();
-        self.content_panel.settings.org_did = config.public.lk_did.clone();
-        self.content_panel.settings.persona_did = config.public.persona_did.to_string();
-        self.content_panel.settings.did_git_sign =
-            detect_did_git_sign_info(config.public.persona_did.as_str());
+        self.content_panel.settings.mediator_did = config.mediator_did().to_string();
+        self.content_panel.settings.org_did = config.account.org_did.clone();
+        self.content_panel.settings.persona_did = config.persona_did().to_string();
+        self.content_panel.settings.did_git_sign = detect_did_git_sign_info(config.persona_did());
         // Sync VTA info
-        self.content_panel.vta.persona_did = config.public.persona_did.to_string();
-        self.content_panel.vta.mediator_did = config.public.mediator_did.clone();
+        self.content_panel.vta.persona_did = config.persona_did().to_string();
+        self.content_panel.vta.mediator_did = config.mediator_did().to_string();
         match &config.key_backend {
             KeyBackend::Vta {
                 vta_url,
@@ -293,22 +292,32 @@ impl MainPageState {
             }
         }
         self.content_panel.vta.key_count = config.key_info.len();
-        // Count persona vs relationship keys
-        self.content_panel.vta.persona_key_count = config
-            .key_info
-            .keys()
-            .filter(|k| k.starts_with(config.public.persona_did.as_str()))
-            .count();
+        // Count persona vs relationship keys. With no active persona (State A)
+        // there are no persona keys — and `starts_with("")` would otherwise match
+        // every key, so guard on a non-empty persona DID.
+        let persona_did = config.persona_did();
+        self.content_panel.vta.persona_key_count = if persona_did.is_empty() {
+            0
+        } else {
+            config
+                .key_info
+                .keys()
+                .filter(|k| k.starts_with(persona_did))
+                .count()
+        };
         self.content_panel.vta.relationship_key_count =
             self.content_panel.vta.key_count - self.content_panel.vta.persona_key_count;
-        // Collect active DIDs
-        let mut active_dids = vec![content::ActiveDid {
-            did: config.public.persona_did.to_string(),
-            label: "Persona".to_string(),
-        }];
+        // Collect active DIDs — none for a zero-persona (State-A) account.
+        let mut active_dids = Vec::new();
+        if !persona_did.is_empty() {
+            active_dids.push(content::ActiveDid {
+                did: persona_did.to_string(),
+                label: "Persona".to_string(),
+            });
+        }
         for (remote_p_did, rel_arc) in &config.private.relationships.relationships {
             if let Ok(rel) = rel_arc.lock()
-                && *rel.our_did != *config.public.persona_did
+                && rel.our_did.as_str() != config.persona_did()
             {
                 let alias = config
                     .private
@@ -338,7 +347,52 @@ impl MainPageState {
                 "Keyring Only (no additional encryption)".to_string()
             }
         };
+
+        // Sync the Communities overview (R-C-*): display order from the model,
+        // archived excluded, with the actions-required count for the badge.
+        let mut community_items = Vec::new();
+        for c in config.account.communities_for_display(false) {
+            let persona = config.account.personas.get(&c.persona_ref);
+            let persona_label = persona
+                .and_then(|p| p.label.clone())
+                .or_else(|| persona.map(|p| shorten_did(&p.did, 24)))
+                .unwrap_or_default();
+            community_items.push(content::CommunitySummary {
+                display_name: c
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| shorten_did(&c.vtc_did, 40)),
+                status_label: community_status_label(&c.status),
+                persona_label,
+                member_since: c
+                    .member_since
+                    .map(|d| d.format("%Y-%m-%d").to_string())
+                    .unwrap_or_default(),
+                favourite: c.favourite,
+                needs_attention: c.needs_attention(),
+            });
+        }
+        let community_count = community_items.len();
+        self.content_panel.communities.actions_required = config.account.actions_required_count();
+        self.content_panel.communities.items = community_items;
+        if self.content_panel.communities.selected_index >= community_count {
+            self.content_panel.communities.selected_index = community_count.saturating_sub(1);
+        }
     }
+}
+
+/// Human-readable label for a community membership status (R-C-2).
+fn community_status_label(status: &openvtc_core::config::account::CommunityStatus) -> String {
+    use openvtc_core::config::account::CommunityStatus;
+    match status {
+        CommunityStatus::Pending { .. } => "Pending",
+        CommunityStatus::Active => "Active",
+        CommunityStatus::Left => "Left",
+        CommunityStatus::Rejected => "Rejected",
+        CommunityStatus::Removed => "Removed",
+        CommunityStatus::Expired => "Expired",
+    }
+    .to_string()
 }
 
 /// Collect VRC summaries from a Vrcs collection.
@@ -481,18 +535,32 @@ pub struct MainMenuConfigState {
 
 impl From<&Box<Config>> for MainMenuConfigState {
     fn from(config: &Box<Config>) -> Self {
-        MainMenuConfigState {
-            name: config.public.friendly_name.clone(),
-            did: config.public.persona_did.clone(),
-        }
+        MainMenuConfigState::from(config.as_ref())
     }
 }
 
 impl From<&Config> for MainMenuConfigState {
     fn from(config: &Config) -> Self {
+        // The persona identity is community-scoped: only surface it in the top
+        // bar once the user is actually in a community (an Active membership). A
+        // State-A account or a still-Pending join shows no persona name/DID up
+        // there — the persona belongs to a community context, not the chrome.
+        let in_community = config
+            .account
+            .communities
+            .values()
+            .any(|c| c.status.is_active());
         MainMenuConfigState {
-            name: config.public.friendly_name.clone(),
-            did: config.public.persona_did.clone(),
+            name: if in_community {
+                config.public.friendly_name.clone()
+            } else {
+                String::new()
+            },
+            did: if in_community {
+                config.persona_did_arc()
+            } else {
+                Arc::new(String::new())
+            },
         }
     }
 }

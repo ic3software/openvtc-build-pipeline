@@ -58,8 +58,13 @@ pub enum SetupPage {
     UnlockCodeAsk,
     UnlockCodeSet,
     UnlockCodeWarn,
+    // R-A-5: persona-minting pages. Unreachable from State-A setup (which ends at
+    // protection → account creation); reconstructed by the State-B join flow
+    // (Stage 4). `#[allow(dead_code)]` until then.
+    #[allow(dead_code)]
     MediatorAsk,
     MediatorCustom,
+    #[allow(dead_code)]
     WebvhServerSelect,
     WebvhServerProgress,
     UserName,
@@ -340,7 +345,9 @@ pub struct WebvhServerState {
     pub completed: Completion,
     pub messages: Vec<MessageType>,
     pub selected_server_id: String,
-    pub custom_path: Option<String>,
+    /// Chosen WebVH path mode: `.well-known` root, an explicit label, or
+    /// server auto-assignment.
+    pub path_mode: vta_sdk::protocols::did_management::create::WebvhPathMode,
     pub did: String,
     pub document: Document,
     pub mnemonic: String,

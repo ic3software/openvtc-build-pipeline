@@ -14,6 +14,7 @@ use ratatui::{
     widgets::{Block, Padding, Paragraph, Wrap},
 };
 use tui_input::{Input, backend::crossterm::EventHandler};
+use vta_sdk::protocols::did_management::create::WebvhPathMode;
 
 use crate::{
     state_handler::{actions::Action, setup_sequence::SetupState},
@@ -154,21 +155,20 @@ fn handle_server_config(state: &mut SetupFlow, key: KeyEvent) {
             let servers = &state.props.state.vta.webvh_servers;
             if let Some(server) = servers.get(state.webvh_server_select.selected_server_index) {
                 let server_id = server.id.clone();
+                // Map the typed path to the SDK's path mode (its `From<String>`
+                // convention): blank → server auto-assign, `.well-known` → root
+                // DID, anything else → that explicit label.
                 let path_value = state.webvh_server_select.path_input.value().to_string();
-                let custom_path = if path_value.is_empty() {
-                    None
-                } else {
-                    Some(path_value)
-                };
+                let path_mode = WebvhPathMode::from(path_value);
 
                 // Store server selection in webvh_server state for UI rendering
                 state.props.state.webvh_server.selected_server_id = server_id.clone();
-                state.props.state.webvh_server.custom_path = custom_path.clone();
+                state.props.state.webvh_server.path_mode = path_mode.clone();
 
                 let result = navigate(
                     SetupEvent::UseWebvhServer {
                         server_id,
-                        custom_path,
+                        path_mode,
                     },
                     &state.props.state,
                 );
@@ -292,7 +292,7 @@ fn render_server_config(
 
     // Path input
     let path_header = Line::styled(
-        "Custom path (optional, leave empty for auto-generated):",
+        "Path — blank: server assigns one  |  \".well-known\": root DID  |  or type a label:",
         Style::new().fg(COLOR_BORDER).bold(),
     );
     frame.render_widget(Paragraph::new(path_header), content[1]);
@@ -335,38 +335,59 @@ fn render_server_config(
         })
         .unwrap_or_default();
 
-    if path_value.is_empty() {
+    let trimmed_path = path_value.trim();
+    if trimmed_path.is_empty() {
         info_lines.push(Line::styled(
-            "If left empty, a random mnemonic phrase will be used as the path.",
+            "Blank → the hosting server assigns a path (a random mnemonic).",
             Style::new().fg(COLOR_DARK_GRAY),
         ));
         info_lines.push(Line::default());
         info_lines.push(Line::from(vec![
             Span::styled("DID document URL: ", Style::new().fg(COLOR_TEXT_DEFAULT)),
             Span::styled(
-                format!("https://{}/{{mnemonic}}/did.jsonl", server_domain),
+                format!("https://{}/{{server-assigned}}/did.jsonl", server_domain),
                 Style::new().fg(COLOR_ORANGE).italic(),
             ),
         ]));
         info_lines.push(Line::from(vec![
             Span::styled("Your DID:         ", Style::new().fg(COLOR_TEXT_DEFAULT)),
             Span::styled(
-                format!("did:webvh:{{scid}}:{}:{{mnemonic}}", server_domain),
+                format!("did:webvh:{{scid}}:{}:{{server-assigned}}", server_domain),
                 Style::new().fg(COLOR_ORANGE).italic(),
             ),
         ]));
-    } else {
+    } else if trimmed_path == ".well-known" {
+        info_lines.push(Line::styled(
+            "Root DID, served at the host's /.well-known/did.jsonl.",
+            Style::new().fg(COLOR_DARK_GRAY),
+        ));
+        info_lines.push(Line::default());
         info_lines.push(Line::from(vec![
             Span::styled("DID document URL: ", Style::new().fg(COLOR_TEXT_DEFAULT)),
             Span::styled(
-                format!("https://{}/{}/did.jsonl", server_domain, path_value),
+                format!("https://{}/.well-known/did.jsonl", server_domain),
                 Style::new().fg(COLOR_SOFT_PURPLE).bold(),
             ),
         ]));
         info_lines.push(Line::from(vec![
             Span::styled("Your DID:         ", Style::new().fg(COLOR_TEXT_DEFAULT)),
             Span::styled(
-                format!("did:webvh:{{scid}}:{}:{}", server_domain, path_value),
+                format!("did:webvh:{{scid}}:{}", server_domain),
+                Style::new().fg(COLOR_SOFT_PURPLE).bold(),
+            ),
+        ]));
+    } else {
+        info_lines.push(Line::from(vec![
+            Span::styled("DID document URL: ", Style::new().fg(COLOR_TEXT_DEFAULT)),
+            Span::styled(
+                format!("https://{}/{}/did.jsonl", server_domain, trimmed_path),
+                Style::new().fg(COLOR_SOFT_PURPLE).bold(),
+            ),
+        ]));
+        info_lines.push(Line::from(vec![
+            Span::styled("Your DID:         ", Style::new().fg(COLOR_TEXT_DEFAULT)),
+            Span::styled(
+                format!("did:webvh:{{scid}}:{}:{}", server_domain, trimmed_path),
                 Style::new().fg(COLOR_SOFT_PURPLE).bold(),
             ),
         ]));

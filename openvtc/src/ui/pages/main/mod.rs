@@ -309,6 +309,62 @@ impl MainPage {
             MainMenu::Settings => self.handle_settings_key(key),
             MainMenu::Logs => self.handle_logs_key(key),
             MainMenu::Help => self.handle_help_key(key),
+            MainMenu::Communities => self.handle_communities_key(key),
+            _ => false,
+        }
+    }
+
+    /// Communities overview keys (R-A-5 Stage 4): `j` starts the join flow
+    /// (incl. from the empty state), ↑/↓ move the selection, `d`/Del removes the
+    /// selected community. Returns true if consumed.
+    fn handle_communities_key(&mut self, key: KeyEvent) -> bool {
+        let comms = &self.props.main_page.content_panel.communities;
+        let count = comms.items.len();
+        let selected = comms.selected_index;
+
+        // A removal confirmation is pending: only confirm (y/Enter) or cancel
+        // (n/Esc) apply; every other key is swallowed so nothing slips through.
+        if let Some(idx) = comms.confirm_delete {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    let _ = self.action_tx.send(Action::DeleteCommunity(idx));
+                }
+                _ => {
+                    let _ = self.action_tx.send(Action::CommunityCancelDelete);
+                }
+            }
+            return true;
+        }
+
+        match key.code {
+            KeyCode::Char('j') => {
+                let _ = self.action_tx.send(Action::StartJoin);
+                true
+            }
+            KeyCode::Up if count > 0 => {
+                let _ = self
+                    .action_tx
+                    .send(Action::CommunitySelect(selected.saturating_sub(1)));
+                true
+            }
+            KeyCode::Down if count > 0 => {
+                let _ = self
+                    .action_tx
+                    .send(Action::CommunitySelect((selected + 1).min(count - 1)));
+                true
+            }
+            KeyCode::Char('d') | KeyCode::Delete if selected < count => {
+                let _ = self
+                    .action_tx
+                    .send(Action::CommunityConfirmDelete(selected));
+                true
+            }
+            KeyCode::Esc => {
+                let _ = self
+                    .action_tx
+                    .send(Action::MainPanelSwitch(MainPanel::MainMenu));
+                true
+            }
             _ => false,
         }
     }
@@ -1561,6 +1617,10 @@ impl ComponentRender<()> for MainPage {
             ]),
             MediatorStatus::Unknown => Line::from(Span::styled(
                 "Mediator: --",
+                ratatui::style::Style::default().fg(COLOR_ORANGE),
+            )),
+            MediatorStatus::NoActiveCommunity => Line::from(Span::styled(
+                "No active community",
                 ratatui::style::Style::default().fg(COLOR_ORANGE),
             )),
         };
