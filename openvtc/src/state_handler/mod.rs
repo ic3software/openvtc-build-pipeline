@@ -76,9 +76,11 @@ pub struct DeferredLoad {
     pub user_pin: SecretString,
 }
 
-#[allow(dead_code)]
 pub enum StartingMode {
     NotSet,
+    // Eager main-page boot path, superseded by `MainPageDeferred` (which main.rs
+    // now constructs). The match-arm handler is retained for the eager path.
+    #[allow(dead_code)]
     MainPage(Box<Config>, TDK),
     MainPageDeferred(DeferredLoad),
     SetupWizard,
@@ -711,9 +713,6 @@ impl StateHandler {
                         )
                         .await;
                     },
-                    Action::Contact(ca) => {
-                        settings_actions::dispatch_contact(ca, &mut config, &mut state, &self.profile);
-                    },
                     Action::Settings(sa) => {
                         match settings_actions::dispatch(
                             sa,
@@ -1319,7 +1318,7 @@ fn handle_nav_action(state: &mut State, action: &Action) -> bool {
 //   inbox_actions::dispatch
 //   relationship_actions::dispatch
 //   credential_actions::dispatch
-//   settings_actions::dispatch / dispatch_contact
+//   settings_actions::dispatch
 
 /// Build a DIDComm trust-pong message in response to a verified ping.
 /// Used inline by the trust-ping handler in the main loop.
