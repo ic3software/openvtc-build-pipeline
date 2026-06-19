@@ -114,9 +114,12 @@ impl StateHandler {
                             // VIC and stash it so the join presents it (mirrors the
                             // `--invitation <file>` launch flag).
                             match serde_json::from_str::<serde_json::Value>(&text) {
-                                Ok(vic) if is_invitation_credential(&vic) => {
+                                Ok(vic)
+                                    if openvtc_core::join::is_invitation_credential(&vic) =>
+                                {
                                     state.invitation_credential = Some(vic);
                                     state.join.has_invitation = true;
+                                    state.join.vic_cleared = false;
                                     state.join.messages.clear();
                                 }
                                 _ => {
@@ -126,6 +129,16 @@ impl StateHandler {
                                     ));
                                 }
                             }
+                            let _ = self.state_tx.send(state.clone());
+                        }
+                        Action::JoinClearVic => {
+                            // Explicit "proceed without a VIC": drop the loaded
+                            // invitation so it isn't presented, and flag the clear so
+                            // the entry page shows "joining without an invitation".
+                            state.invitation_credential = None;
+                            state.join.has_invitation = false;
+                            state.join.vic_cleared = true;
+                            state.join.messages.clear();
                             let _ = self.state_tx.send(state.clone());
                         }
                         Action::JoinSubmitVtc(vtc_did) => {
@@ -450,19 +463,6 @@ async fn build_linkage_proof(
             None
         }
     }
-}
-
-/// Whether a pasted/loaded JSON value is an InvitationCredential (its `type`
-/// array carries the `InvitationCredential` tag).
-fn is_invitation_credential(value: &serde_json::Value) -> bool {
-    value
-        .get("type")
-        .and_then(|t| t.as_array())
-        .is_some_and(|types| {
-            types
-                .iter()
-                .any(|t| t.as_str() == Some("InvitationCredential"))
-        })
 }
 
 /// Idempotency decision (R-B-9): is there already a *live* (Active/Pending)
